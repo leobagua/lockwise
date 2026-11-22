@@ -53,6 +53,22 @@ RSpec.describe Lockwise do
     expect(column_exists?(connection, 'note')).to be(true)
   end
 
+  it 'makes two runs on the same table take turns, in order of arrival' do
+    release, blocker = open_transaction_on_accounts
+    sleep 1
+    first = lock_accounts_in_background('ALTER TABLE accounts ADD COLUMN note text', max_pause: 0.5, poll: 0.05)
+    sleep 0.05 until weak_lock_held?(connection)
+    second = lock_accounts_in_background('ALTER TABLE accounts ADD COLUMN owner text', max_pause: 0.5, poll: 0.05)
+    sleep 0.05 until weak_lock_waiting?(connection)
+
+    release.push(true)
+    blocker.join
+
+    expect(first.value).to be < second.value
+    expect(column_exists?(connection, 'note')).to be(true)
+    expect(column_exists?(connection, 'owner')).to be(true)
+  end
+
   it 'gives up after a failed request when there is no time for another one' do
     release, blocker, blocker_pid = open_transaction_on_accounts
 

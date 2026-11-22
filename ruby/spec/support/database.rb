@@ -35,17 +35,25 @@ module Database
   end
 
   # Runs Lockwise.with_lock on accounts in a thread, with its own connection.
+  # The value of the thread is the time the statement ran.
   def lock_accounts_in_background(statement, **options)
     Thread.new do
       background = connect
-      Lockwise.with_lock(background, 'accounts', **options) { background.exec(statement) }
+      ran_at = Lockwise.with_lock(background, 'accounts', **options) do
+        background.exec(statement)
+        monotonic_now
+      end
       background.close
+      ran_at
     end
   end
 
   def weak_lock_held?(connection)
-    sql = "SELECT count(*) FROM pg_locks WHERE relation = 'accounts'::regclass AND mode = 'ShareUpdateExclusiveLock'"
-    connection.exec(sql).getvalue(0, 0) != '0'
+    weak_locks(connection, granted: true).positive?
+  end
+
+  def weak_lock_waiting?(connection)
+    weak_locks(connection, granted: false).positive?
   end
 
   def column_exists?(connection, column)
@@ -58,6 +66,14 @@ module Database
   end
 
   private
+
+  def weak_locks(connection, granted:)
+    sql = <<~SQL
+      SELECT count(*) FROM pg_locks
+       WHERE relation = 'accounts'::regclass AND mode = 'ShareUpdateExclusiveLock' AND granted = $1
+    SQL
+    connection.exec_params(sql, [granted]).getvalue(0, 0).to_i
+  end
 
   def hold_transaction(statement, started, release)
     blocker = connect
