@@ -3,6 +3,7 @@
 require 'pg'
 require 'lockwise'
 require_relative 'support/database'
+require_relative 'support/traffic'
 
 RSpec.configure do |config|
   config.include Database

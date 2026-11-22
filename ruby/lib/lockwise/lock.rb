@@ -105,6 +105,8 @@ module Lockwise
     end
 
     def blockers(modes, minimum_age)
+      # Inside a transaction, pg_stat_activity is frozen at its first read.
+      @connection.exec('SELECT pg_stat_clear_snapshot()')
       @connection.exec_params(BLOCKERS, [@table, modes, minimum_age]).map do |row|
         Blocker.new(row['pid'].to_i, row['application_name'], row['backend_type'], row['age'].to_f)
       end
