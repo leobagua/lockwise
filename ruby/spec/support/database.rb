@@ -25,6 +25,15 @@ module Database
     [release, thread, started.pop]
   end
 
+  # Returns a thread whose value is the time the transaction was released.
+  def release_after(release, seconds)
+    Thread.new do
+      sleep seconds
+      release.push(true)
+      monotonic_now
+    end
+  end
+
   def weak_lock_held?(connection)
     sql = "SELECT count(*) FROM pg_locks WHERE relation = 'accounts'::regclass AND mode = 'ShareUpdateExclusiveLock'"
     connection.exec(sql).getvalue(0, 0) != '0'

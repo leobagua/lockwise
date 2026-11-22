@@ -26,18 +26,28 @@ module Lockwise
                 pg_stat_activity.backend_type, pg_stat_activity.xact_start
     SQL
 
-    def initialize(connection, table, max_pause: 3.0, poll: 0.2, max_runtime: 120.0)
+    class AttemptFailed < StandardError; end
+    private_constant :AttemptFailed
+
+    def initialize(connection, table, max_pause: 3.0, poll: 0.2, cooldown: 10.0, max_runtime: 120.0)
       @connection = connection
       @table = table
       @max_pause = max_pause
       @poll = poll
+      @cooldown = cooldown
       @max_runtime = max_runtime
     end
 
     def run(&)
       refuse_open_transaction
       @deadline = monotonic_now + @max_runtime
-      in_transaction(&)
+      begin
+        in_transaction(&)
+      rescue AttemptFailed
+        give_up('attempt_failed', STRONG_LOCK_CONFLICTS, 0) if monotonic_now + @cooldown >= @deadline
+        sleep(@cooldown)
+        retry
+      end
     end
 
     private
@@ -83,10 +93,14 @@ module Lockwise
     def take_strong_lock
       @connection.exec("SET LOCAL lock_timeout = '#{milliseconds(@max_pause)}ms'")
       @connection.exec("LOCK TABLE #{quoted_table} IN ACCESS EXCLUSIVE MODE")
+    rescue PG::LockNotAvailable
+      # A failed request for ACCESS EXCLUSIVE leaves an xid on the transaction,
+      # so the whole transaction ends before the next attempt.
+      raise AttemptFailed
     end
 
     def give_up(reason, modes, minimum_age)
-      @connection.exec('ROLLBACK')
+      @connection.exec('ROLLBACK') unless idle?
       raise GaveUpError.new(reason, blockers(modes, minimum_age))
     end
 

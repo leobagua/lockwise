@@ -9,22 +9,47 @@ RSpec.describe Lockwise do
   it 'waits for an open transaction to end, then runs the block' do
     release, blocker = open_transaction_on_accounts
     sleep 1 # older than max_pause, so the lock has to wait for it
-    released_at = nil
-    releaser = Thread.new do
-      sleep 1
-      released_at = monotonic_now
-      release.push(true)
-    end
+    releaser = release_after(release, 1)
 
     ran_at = nil
     described_class.with_lock(connection, 'accounts', max_pause: 0.5, poll: 0.05) do
       ran_at = monotonic_now
       connection.exec('ALTER TABLE accounts ADD COLUMN note text')
     end
-    [releaser, blocker].each(&:join)
+    blocker.join
 
-    expect(ran_at).to be > released_at
+    expect(ran_at).to be > releaser.value
     expect(column_exists?(connection, 'note')).to be(true)
+  end
+
+  it 'tries again after a strong lock request that times out' do
+    release, blocker = open_transaction_on_accounts
+    releaser = release_after(release, 1.5) # still young when the lock looks, so the first request times out
+
+    ran_at = []
+    described_class.with_lock(connection, 'accounts', max_pause: 0.5, poll: 0.05, cooldown: 0.2) do
+      ran_at << monotonic_now
+      connection.exec('ALTER TABLE accounts ADD COLUMN note text')
+    end
+    blocker.join
+
+    expect(ran_at.size).to eq(1)
+    expect(ran_at.first).to be > releaser.value
+    expect(column_exists?(connection, 'note')).to be(true)
+  end
+
+  it 'gives up after a failed request when there is no time for another one' do
+    release, blocker, blocker_pid = open_transaction_on_accounts
+
+    expect { described_class.with_lock(connection, 'accounts', max_pause: 0.5, cooldown: 1, max_runtime: 1) { nil } }
+      .to raise_error(Lockwise::GaveUpError) { |error|
+        expect(error.reason).to eq('attempt_failed')
+        expect(error.blockers.map(&:pid)).to eq([blocker_pid])
+      }
+
+    expect(weak_lock_held?(connection)).to be(false)
+    release.push(true)
+    blocker.join
   end
 
   it 'gives up and names the long transaction that never ends' do
