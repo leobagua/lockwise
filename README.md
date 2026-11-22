@@ -22,6 +22,23 @@ It does three things, in this order.
 2. **Looks before it asks.** It checks who is using the table and for how long. If there is a long transaction, it waits for it to end. The table keeps working.
 3. **Asks for the strong lock once, with a deadline.** If it gets the lock, it runs the DDL and releases. If a gap never shows up, it does not ask, and it tells you who is blocking.
 
+## Advantages
+
+- **The wait uses no XID.** A transaction that holds only the weak lock has no transaction ID. It does not hold back the vacuum horizon.
+- **The wait does not grow snapshots.** With no XID, the waiting transaction does not show up in the snapshots of other sessions.
+- **The wait does not block traffic.** Reads and writes keep running, and their locks stay on the fast path.
+- **Autovacuum yields by itself.** A regular autovacuum on the table is cancelled after `deadlock_timeout`. No extra privilege is needed.
+- **DDLs run in order.** Two migrations on the same table queue on the weak lock, in order of arrival.
+- **One pause, with a known size.** The table is paused once, for at most `max_pause_ms`.
+- **Blockers are named.** The `waiting` event lists the sessions in the way.
+
+## Disadvantages
+
+- **The strong lock request takes an XID.** A request for `ACCESS EXCLUSIVE` gets a transaction ID before it waits. While it waits, that XID grows the snapshots of other sessions and holds back the vacuum horizon. This also applies to a strong lock request from another session that waits behind the weak lock.
+- **A strong lock request behind the weak lock queues traffic.** If another session asks for a strong lock while lockwise holds the weak lock, new queries queue behind that request until it times out.
+- **Maintenance on the table waits.** While the weak lock is held, `VACUUM`, `ANALYZE` and `CREATE INDEX CONCURRENTLY` on that table wait.
+- **The table is still paused once.** The pause lasts until the transactions in flight end, up to `max_pause_ms`.
+
 ## Usage
 
 ```bash
