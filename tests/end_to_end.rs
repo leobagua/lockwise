@@ -1,6 +1,7 @@
 use postgres::{Client, NoTls};
 use serde_json::Value;
-use std::process::{Command, Output};
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{channel, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -46,12 +47,16 @@ fn release_after(release: Sender<()>, delay: Duration) -> JoinHandle<()> {
     })
 }
 
-fn run_lockwise(preset: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_lockwise"))
+fn lockwise_command(preset: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lockwise"));
+    command
         .args(["run", "--conn", &connection_string(), "--preset", preset])
-        .args(["--lock", "accounts:ael", "--sql", ADD_COLUMN])
-        .output()
-        .unwrap()
+        .args(["--lock", "accounts:ael", "--sql", ADD_COLUMN]);
+    command
+}
+
+fn run_lockwise(preset: &str) -> Output {
+    lockwise_command(preset).output().unwrap()
 }
 
 fn events(output: &Output) -> Vec<Value> {
@@ -131,4 +136,34 @@ fn retries_after_a_strong_lock_request_that_times_out() {
     assert_eq!(events[4]["cause"], "long_blockers");
     assert_eq!(events.last().unwrap()["attempts"], 2);
     assert!(note_column_exists(&mut client));
+}
+
+#[test]
+fn reads_and_writes_keep_running_while_the_tool_waits_on_the_weak_lock() {
+    let mut client = create_accounts_table();
+    let (release, blocker) = open_transaction_on_accounts();
+    thread::sleep(Duration::from_secs(1));
+
+    let mut lockwise = lockwise_command("tests/window.toml").stdout(Stdio::piped()).spawn().unwrap();
+    let mut lines = BufReader::new(lockwise.stdout.take().unwrap()).lines();
+    let waiting = lines.by_ref().map(Result::unwrap).find(|line| line.contains(r#""event":"waiting""#));
+    assert!(waiting.is_some());
+
+    let weak_locks: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_locks
+              WHERE relation = 'accounts'::regclass AND mode = 'ShareUpdateExclusiveLock' AND granted",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(weak_locks, 1);
+
+    client.batch_execute("SET lock_timeout = '200ms'; INSERT INTO accounts VALUES (2)").unwrap();
+    let rows: i64 = client.query_one("SELECT count(*) FROM accounts", &[]).unwrap().get(0);
+    assert_eq!(rows, 2);
+
+    release.send(()).unwrap();
+    blocker.join().unwrap();
+    assert!(lockwise.wait().unwrap().success());
 }
