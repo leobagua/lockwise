@@ -9,12 +9,14 @@ import sys
 from pathlib import Path
 
 LOOP_SECONDS = 12.0
+# The timeline below is written for a 12 s loop and played back 40% slower.
+PLAYBACK_SECONDS = LOOP_SECONDS / 0.6
 SPAWN_EVERY = 0.35
 LAST_SPAWN = 10.0
 SPAWN_X = 30
 GATE_X = 590
 TABLE_X = 700
-QUEUE_GAP = 24
+QUEUE_GAP = 21
 SPEED = 350.0
 GREEN = "#16a34a"
 RED = "#dc2626"
@@ -92,10 +94,12 @@ def captions(lines):
 
 
 def document(styles, shapes, freeze):
-    frozen = f"animation-delay:-{freeze}s;animation-play-state:paused;" if freeze is not None else ""
+    frozen = ""
+    if freeze is not None:
+        frozen = f"animation-delay:-{freeze / LOOP_SECONDS * PLAYBACK_SECONDS}s;animation-play-state:paused;"
     return f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 290" font-family="Helvetica, Arial, sans-serif">
 <style>
-.moving{{animation-duration:{LOOP_SECONDS}s;animation-timing-function:linear;animation-iteration-count:infinite;{frozen}}}
+.moving{{animation-duration:{PLAYBACK_SECONDS}s;animation-timing-function:linear;animation-iteration-count:infinite;{frozen}}}
 .caption{{font-size:21px;font-weight:700;fill:#0f172a;text-anchor:middle}}
 .label{{font-size:15px;fill:#475569;text-anchor:middle}}
 .inside{{font-size:14px;font-weight:700;fill:#ffffff;text-anchor:middle}}
@@ -127,21 +131,33 @@ def ddl_block(name, label, steps):
     return [keyframes(name, steps)], [shape]
 
 
-def problem():
-    pauses = [(2.0, 5.5), (7.0, 10.5)]
+def ddl_at_gate_during(pauses):
     away, at_gate = "transform:translateY(-48px);opacity:0", "transform:translateY(0);opacity:1"
     steps = [(0, away)]
     for start, end in pauses:
         steps += [(start - 0.3, away), (start, at_gate), (end, at_gate), (end + 0.3, away)]
     steps.append((LOOP_SECONDS, away))
-    parts = [query_dots(pauses), long_transaction(), ddl_block("ddl", "DDL", steps), captions([
+    return ddl_block("ddl", "DDL", steps)
+
+
+def problem():
+    pauses = [(2.0, 9.6)]
+    return [query_dots(pauses), long_transaction(end=9.3), ddl_at_gate_during(pauses), captions([
         (0.0, 2.0, "Queries run. A long transaction is open."),
-        (2.0, 5.5, "The DDL waits for the lock. New queries queue behind it."),
-        (5.5, 7.0, "Timeout. The DDL gives up."),
-        (7.0, 10.5, "Retry. The table stops again."),
-        (10.5, 12.0, "After many retries, the migration fails."),
+        (2.0, 9.6, "The DDL waits for the lock. Every new query queues behind it."),
+        (9.6, 12.0, "The table was stopped for the whole wait."),
     ])]
-    return parts
+
+
+def retries():
+    pauses = [(1.6, 2.4), (3.6, 5.0), (6.2, 8.4)]
+    return [query_dots(pauses), long_transaction(), ddl_at_gate_during(pauses), captions([
+        (0.0, 1.6, "The usual fix: a short lock_timeout, then retry."),
+        (1.6, 3.4, "Attempt 1 times out. The table stopped for a moment."),
+        (3.4, 6.0, "Attempt 2 waits longer. The queue is longer."),
+        (6.0, 8.6, "Attempt 3 waits longer still."),
+        (8.6, 12.0, "The long transaction is still open. The migration fails."),
+    ])]
 
 
 def solution():
@@ -170,6 +186,7 @@ def main():
     folder = Path(__file__).parent
     suffix = f"-{freeze}" if freeze is not None else ""
     write(folder / f"problem{suffix}.svg", problem(), freeze)
+    write(folder / f"retries{suffix}.svg", retries(), freeze)
     write(folder / f"solution{suffix}.svg", solution(), freeze)
 
 
