@@ -8,6 +8,8 @@ It is a single binary that talks plain SQL to the server.
 
 ## The problem
 
+![Queries queue behind a DDL that waits for its lock](assets/problem.svg)
+
 DDL locks on busy tables can lead to lock contention.
 
 A DDL such as `ALTER TABLE` needs a strong lock. While it waits for that lock, every new query on the table queues behind it. On a busy table the queue grows fast, connections pile up and the application slows down or fails.
@@ -15,6 +17,8 @@ A DDL such as `ALTER TABLE` needs a strong lock. While it waits for that lock, e
 The usual answer is to ask for the lock with a short timeout and retry. Each request still stops the table for a moment. After hundreds of requests the migration gives up without running, and the contention happened anyway.
 
 ## How lockwise solves it
+
+![lockwise waits on a weak lock and pauses the table once](assets/solution.svg)
 
 It does three things, in this order.
 
