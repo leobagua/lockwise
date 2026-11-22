@@ -27,6 +27,36 @@ RSpec.describe Lockwise do
     expect(column_exists?(connection, 'note')).to be(true)
   end
 
+  it 'gives up and names the long transaction that never ends' do
+    release, blocker, blocker_pid = open_transaction_on_accounts
+    sleep 1
+    block_ran = false
+
+    expect { described_class.with_lock(connection, 'accounts', max_pause: 0.5, max_runtime: 1) { block_ran = true } }
+      .to raise_error(Lockwise::GaveUpError) { |error|
+        expect(error.reason).to eq('long_blockers')
+        expect(error.blockers.map(&:pid)).to eq([blocker_pid])
+      }
+
+    expect(block_ran).to be(false)
+    expect(weak_lock_held?(connection)).to be(false)
+    release.push(true)
+    blocker.join
+  end
+
+  it 'gives up and names the session that holds the weak lock' do
+    release, blocker, blocker_pid = open_transaction_on_accounts(Database::WEAK_LOCK)
+
+    expect { described_class.with_lock(connection, 'accounts', max_runtime: 1) { nil } }
+      .to raise_error(Lockwise::GaveUpError) { |error|
+        expect(error.reason).to eq('prelock_timeout')
+        expect(error.blockers.map(&:pid)).to eq([blocker_pid])
+      }
+
+    release.push(true)
+    blocker.join
+  end
+
   it 'refuses a connection that is already in a transaction and leaves it open' do
     connection.exec('BEGIN')
     block_ran = false

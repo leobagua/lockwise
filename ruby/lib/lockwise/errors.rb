@@ -1,0 +1,27 @@
+# frozen_string_literal: true
+
+module Lockwise
+  class Error < StandardError; end
+  class TransactionOpenError < Error; end
+
+  Blocker = Struct.new(:pid, :application, :backend_type, :age)
+
+  # Raised when the time runs out before the strong lock could be asked for.
+  class GaveUpError < Error
+    attr_reader :reason, :blockers
+
+    def initialize(reason, blockers)
+      @reason = reason
+      @blockers = blockers
+      super("gave up (#{reason}), blocked by #{describe_blockers}")
+    end
+
+    private
+
+    def describe_blockers
+      return 'no session in sight' if blockers.empty?
+
+      blockers.map { |blocker| "pid #{blocker.pid} (#{blocker.backend_type}, #{blocker.age.round(1)}s)" }.join(', ')
+    end
+  end
+end
