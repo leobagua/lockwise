@@ -2,3 +2,4 @@
 target/
 tests/.run/
 .DS_Store
+ruby/Gemfile.lock
