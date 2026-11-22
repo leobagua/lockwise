@@ -1,0 +1,8 @@
+name = "test-window"
+max_runtime_s = 20
+
+[window]
+max_pause_ms = 500
+cooldown_ms = 200
+poll_ms = 50
+prelock_hold_s = 10

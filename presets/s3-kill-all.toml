@@ -1,0 +1,9 @@
+# Reference ceiling: terminate every lock holder after a failed attempt, like pg_repack.
+name = "s3-kill-all"
+max_runtime_s = 120
+kill = "all"
+
+[schedule]
+kind = "fixed"
+repeat = 10
+steps = [[1000, 0]]

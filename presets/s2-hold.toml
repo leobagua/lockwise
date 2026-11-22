@@ -1,0 +1,13 @@
+# Hold the queue position under a damage watcher, as in GitLab MR 251902.
+name = "s2-hold"
+max_runtime_s = 120
+
+[schedule]
+kind = "fixed"
+repeat = 1
+steps = [[1000, 1000], [7000, 2000], [7000, 2000], [7000, 2000]]
+
+[watcher]
+poll_ms = 1000
+budget_blocked_seconds = 10.0
+queue_cap = 20

@@ -1,0 +1,9 @@
+# No strong lock at all: SHARE UPDATE EXCLUSIVE never queues behind traffic. Run it
+# with LOCKS="child:sue" to measure the damage the lab reports when nothing blocks.
+name = "control"
+max_runtime_s = 20
+
+[schedule]
+kind = "fixed"
+repeat = 1
+steps = [[1000, 0]]

@@ -1,0 +1,106 @@
+use postgres::{Client, NoTls};
+use serde_json::Value;
+use std::process::{Command, Output};
+use std::sync::mpsc::{channel, Sender};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+const ADD_COLUMN: &str = "ALTER TABLE accounts ADD COLUMN note text";
+
+fn connection_string() -> String {
+    std::env::var("LOCKWISE_TEST_CONN").expect("run the tests through tests/run.sh")
+}
+
+fn connect() -> Client {
+    Client::connect(&connection_string(), NoTls).unwrap()
+}
+
+fn create_accounts_table() -> Client {
+    let mut client = connect();
+    client
+        .batch_execute("DROP TABLE IF EXISTS accounts; CREATE TABLE accounts (id int PRIMARY KEY); INSERT INTO accounts VALUES (1)")
+        .unwrap();
+    client
+}
+
+/// Holds a row lock on accounts until the returned sender is used or dropped.
+fn open_transaction_on_accounts() -> (Sender<()>, JoinHandle<()>) {
+    let (release, released) = channel();
+    let (locked, lock_taken) = channel();
+    let handle = thread::spawn(move || {
+        let mut client = connect();
+        let mut transaction = client.transaction().unwrap();
+        transaction.execute("UPDATE accounts SET id = id WHERE id = 1", &[]).unwrap();
+        locked.send(()).unwrap();
+        let _ = released.recv();
+        transaction.commit().unwrap();
+    });
+    lock_taken.recv().unwrap();
+    (release, handle)
+}
+
+fn run_lockwise(preset: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_lockwise"))
+        .args(["run", "--conn", &connection_string(), "--preset", preset])
+        .args(["--lock", "accounts:ael", "--sql", ADD_COLUMN])
+        .output()
+        .unwrap()
+}
+
+fn events(output: &Output) -> Vec<Value> {
+    String::from_utf8_lossy(&output.stdout).lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+}
+
+fn names(events: &[Value]) -> Vec<&str> {
+    events.iter().map(|event| event["event"].as_str().unwrap()).collect()
+}
+
+fn note_column_exists(client: &mut Client) -> bool {
+    let columns: i64 = client
+        .query_one(
+            "SELECT count(*) FROM information_schema.columns WHERE table_name = 'accounts' AND column_name = 'note'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    columns == 1
+}
+
+#[test]
+fn waits_for_an_open_transaction_then_runs_the_ddl() {
+    let mut client = create_accounts_table();
+    let (release, blocker) = open_transaction_on_accounts();
+    // Lets the transaction grow older than max_pause_ms before the tool looks.
+    thread::sleep(Duration::from_secs(1));
+    let releaser = thread::spawn(move || {
+        thread::sleep(Duration::from_secs(1));
+        release.send(()).unwrap();
+    });
+
+    let output = run_lockwise("tests/window.toml");
+    releaser.join().unwrap();
+    blocker.join().unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(names(&events(&output)), ["queued", "prelocked", "waiting", "acquired", "result"]);
+    assert!(note_column_exists(&mut client));
+}
+
+#[test]
+fn gives_up_without_asking_for_the_strong_lock_when_the_transaction_never_ends() {
+    let mut client = create_accounts_table();
+    let (release, blocker) = open_transaction_on_accounts();
+    thread::sleep(Duration::from_secs(1));
+
+    let output = run_lockwise("tests/window-short.toml");
+    release.send(()).unwrap();
+    blocker.join().unwrap();
+
+    let events = events(&output);
+    let result = events.last().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(names(&events), ["queued", "prelocked", "waiting", "result"]);
+    assert_eq!(result["reason"], "long_blockers");
+    assert_eq!(result["attempts"], 0);
+    assert!(!note_column_exists(&mut client));
+}

@@ -1,0 +1,10 @@
+# Short random lock_timeout with exponential backoff and full jitter, as in GitLab MR 257604.
+name = "s1-jitter"
+max_runtime_s = 120
+
+[schedule]
+kind = "jitter"
+timeouts_ms = [50, 100, 200, 300]
+base_sleep_ms = 100
+max_sleep_ms = 60000
+attempts = 30

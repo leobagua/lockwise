@@ -1,0 +1,10 @@
+# Candidate: pre-lock, wait outside the queue for long blockers, then one
+# strong lock request that may pause the tables for at most 3000 ms.
+name = "c1-window-3000ms"
+max_runtime_s = 120
+
+[window]
+max_pause_ms = 3000
+cooldown_ms = 10000
+poll_ms = 200
+prelock_hold_s = 60
