@@ -28,6 +28,22 @@ It does three things, in this order.
 2. **Looks before it asks.** It checks who is using the table and for how long. If there is a long transaction, it waits for it to end. The table keeps working.
 3. **Asks for the strong lock once, with a deadline.** If it gets the lock, it runs the DDL and releases. If a gap never shows up, it does not ask, and it tells you who is blocking.
 
+```mermaid
+flowchart TD
+    start([lockwise run]) --> weak[Take the weak lock]
+    weak --> look[Look at who is using the table]
+    look --> long{Long transaction in the way?}
+    long -- yes --> wait[Wait for it to end. Traffic keeps running]
+    wait --> look
+    wait -. time is up .-> gaveup([Give up and list the blockers])
+    long -- no --> strong[Ask for the strong lock once, with a deadline]
+    strong --> got{Got the lock?}
+    got -- yes --> ddl[Run the DDL and commit]
+    ddl --> done([Success])
+    got -- no --> release[Release everything and wait a moment]
+    release --> weak
+```
+
 ## Advantages
 
 - **The wait uses no XID.** A transaction that holds only the weak lock has no transaction ID. It does not hold back the vacuum horizon.
