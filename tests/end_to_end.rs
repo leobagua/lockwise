@@ -1,12 +1,13 @@
 use postgres::{Client, NoTls};
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{channel, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-const ADD_COLUMN: &str = "ALTER TABLE accounts ADD COLUMN note text";
+const ADD_NOTE: &str = "ALTER TABLE accounts ADD COLUMN note text";
+const ADD_OWNER: &str = "ALTER TABLE accounts ADD COLUMN owner text";
 
 fn connection_string() -> String {
     std::env::var("LOCKWISE_TEST_CONN").expect("run the tests through tests/run.sh")
@@ -47,16 +48,38 @@ fn release_after(release: Sender<()>, delay: Duration) -> JoinHandle<()> {
     })
 }
 
-fn lockwise_command(preset: &str) -> Command {
+fn lockwise_command(preset: &str, sql: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lockwise"));
     command
         .args(["run", "--conn", &connection_string(), "--preset", preset])
-        .args(["--lock", "accounts:ael", "--sql", ADD_COLUMN]);
+        .args(["--lock", "accounts:ael", "--sql", sql]);
     command
 }
 
 fn run_lockwise(preset: &str) -> Output {
-    lockwise_command(preset).output().unwrap()
+    lockwise_command(preset, ADD_NOTE).output().unwrap()
+}
+
+/// Starts the tool in the background and returns it with its event lines.
+fn start_lockwise(sql: &str) -> (Child, impl Iterator<Item = Value>) {
+    let mut lockwise = lockwise_command("tests/window.toml", sql).stdout(Stdio::piped()).spawn().unwrap();
+    let lines = BufReader::new(lockwise.stdout.take().unwrap()).lines();
+    (lockwise, lines.map(|line| serde_json::from_str(&line.unwrap()).unwrap()))
+}
+
+fn next_event(events: &mut impl Iterator<Item = Value>, name: &str) -> Value {
+    events.find(|event| event["event"] == name).unwrap_or_else(|| panic!("no {name} event"))
+}
+
+fn weak_locks_on_accounts(client: &mut Client, granted: bool) -> i64 {
+    client
+        .query_one(
+            "SELECT count(*) FROM pg_locks
+              WHERE relation = 'accounts'::regclass AND mode = 'ShareUpdateExclusiveLock' AND granted = $1",
+            &[&granted],
+        )
+        .unwrap()
+        .get(0)
 }
 
 fn events(output: &Output) -> Vec<Value> {
@@ -67,11 +90,11 @@ fn names(events: &[Value]) -> Vec<&str> {
     events.iter().map(|event| event["event"].as_str().unwrap()).collect()
 }
 
-fn note_column_exists(client: &mut Client) -> bool {
+fn column_exists(client: &mut Client, column: &str) -> bool {
     let columns: i64 = client
         .query_one(
-            "SELECT count(*) FROM information_schema.columns WHERE table_name = 'accounts' AND column_name = 'note'",
-            &[],
+            "SELECT count(*) FROM information_schema.columns WHERE table_name = 'accounts' AND column_name = $1",
+            &[&column],
         )
         .unwrap()
         .get(0);
@@ -92,7 +115,7 @@ fn waits_for_an_open_transaction_then_runs_the_ddl() {
 
     assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(names(&events(&output)), ["queued", "prelocked", "waiting", "acquired", "result"]);
-    assert!(note_column_exists(&mut client));
+    assert!(column_exists(&mut client, "note"));
 }
 
 #[test]
@@ -111,7 +134,7 @@ fn gives_up_without_asking_for_the_strong_lock_when_the_transaction_never_ends()
     assert_eq!(names(&events), ["queued", "prelocked", "waiting", "result"]);
     assert_eq!(result["reason"], "long_blockers");
     assert_eq!(result["attempts"], 0);
-    assert!(!note_column_exists(&mut client));
+    assert!(!column_exists(&mut client, "note"));
 }
 
 #[test]
@@ -135,7 +158,7 @@ fn retries_after_a_strong_lock_request_that_times_out() {
     assert_eq!(events[2]["cause"], "attempt_failed");
     assert_eq!(events[4]["cause"], "long_blockers");
     assert_eq!(events.last().unwrap()["attempts"], 2);
-    assert!(note_column_exists(&mut client));
+    assert!(column_exists(&mut client, "note"));
 }
 
 #[test]
@@ -144,20 +167,9 @@ fn reads_and_writes_keep_running_while_the_tool_waits_on_the_weak_lock() {
     let (release, blocker) = open_transaction_on_accounts();
     thread::sleep(Duration::from_secs(1));
 
-    let mut lockwise = lockwise_command("tests/window.toml").stdout(Stdio::piped()).spawn().unwrap();
-    let mut lines = BufReader::new(lockwise.stdout.take().unwrap()).lines();
-    let waiting = lines.by_ref().map(Result::unwrap).find(|line| line.contains(r#""event":"waiting""#));
-    assert!(waiting.is_some());
-
-    let weak_locks: i64 = client
-        .query_one(
-            "SELECT count(*) FROM pg_locks
-              WHERE relation = 'accounts'::regclass AND mode = 'ShareUpdateExclusiveLock' AND granted",
-            &[],
-        )
-        .unwrap()
-        .get(0);
-    assert_eq!(weak_locks, 1);
+    let (mut lockwise, mut events) = start_lockwise(ADD_NOTE);
+    next_event(&mut events, "waiting");
+    assert_eq!(weak_locks_on_accounts(&mut client, true), 1);
 
     client.batch_execute("SET lock_timeout = '200ms'; INSERT INTO accounts VALUES (2)").unwrap();
     let rows: i64 = client.query_one("SELECT count(*) FROM accounts", &[]).unwrap().get(0);
@@ -166,4 +178,30 @@ fn reads_and_writes_keep_running_while_the_tool_waits_on_the_weak_lock() {
     release.send(()).unwrap();
     blocker.join().unwrap();
     assert!(lockwise.wait().unwrap().success());
+}
+
+#[test]
+fn two_runs_on_the_same_table_take_turns_in_order_of_arrival() {
+    let mut client = create_accounts_table();
+    let (release, blocker) = open_transaction_on_accounts();
+    thread::sleep(Duration::from_secs(1));
+
+    let (mut first, mut first_events) = start_lockwise(ADD_NOTE);
+    next_event(&mut first_events, "waiting");
+    let (mut second, mut second_events) = start_lockwise(ADD_OWNER);
+    while weak_locks_on_accounts(&mut client, false) == 0 {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(weak_locks_on_accounts(&mut client, true), 1);
+
+    release.send(()).unwrap();
+    blocker.join().unwrap();
+    let first_acquired = next_event(&mut first_events, "acquired")["at"].as_f64().unwrap();
+    let second_acquired = next_event(&mut second_events, "acquired")["at"].as_f64().unwrap();
+
+    assert!(first.wait().unwrap().success());
+    assert!(second.wait().unwrap().success());
+    assert!(first_acquired < second_acquired);
+    assert!(column_exists(&mut client, "note"));
+    assert!(column_exists(&mut client, "owner"));
 }
