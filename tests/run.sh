@@ -17,10 +17,12 @@ cat >>"$RUN/data/postgresql.conf" <<CONF
 listen_addresses = ''
 unix_socket_directories = '$RUN'
 fsync = off
+autovacuum_naptime = 1s
+deadlock_timeout = 1s
 CONF
 "$BIN/pg_ctl" -D "$RUN/data" -l "$RUN/server.log" -w start >/dev/null
 "$BIN/psql" -X -q -h "$RUN" -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c "CREATE ROLE mig LOGIN" -c "GRANT pg_monitor TO mig" -c "CREATE DATABASE lab OWNER mig"
 
 cd "$HERE/.."
-LOCKWISE_TEST_CONN="host=$RUN user=mig dbname=lab" cargo test --test end_to_end -- --test-threads=1
+LOCKWISE_TEST_CONN="host=$RUN user=mig dbname=lab" LOCKWISE_TEST_SERVER_LOG="$RUN/server.log" cargo test --test end_to_end -- --test-threads=1

@@ -20,7 +20,7 @@ fn connect() -> Client {
 fn create_accounts_table() -> Client {
     let mut client = connect();
     client
-        .batch_execute("DROP TABLE IF EXISTS accounts; CREATE TABLE accounts (id int PRIMARY KEY); INSERT INTO accounts VALUES (1)")
+        .batch_execute("DROP TABLE IF EXISTS accounts; CREATE TABLE accounts (id int PRIMARY KEY) WITH (autovacuum_enabled = false); INSERT INTO accounts VALUES (1)")
         .unwrap();
     client
 }
@@ -48,21 +48,21 @@ fn release_after(release: Sender<()>, delay: Duration) -> JoinHandle<()> {
     })
 }
 
-fn lockwise_command(preset: &str, sql: &str) -> Command {
+fn lockwise_command(preset: &str, table: &str, sql: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lockwise"));
     command
         .args(["run", "--conn", &connection_string(), "--preset", preset])
-        .args(["--lock", "accounts:ael", "--sql", sql]);
+        .args(["--lock", &format!("{table}:ael"), "--sql", sql]);
     command
 }
 
 fn run_lockwise(preset: &str) -> Output {
-    lockwise_command(preset, ADD_NOTE).output().unwrap()
+    lockwise_command(preset, "accounts", ADD_NOTE).output().unwrap()
 }
 
 /// Starts the tool in the background and returns it with its event lines.
 fn start_lockwise(sql: &str) -> (Child, impl Iterator<Item = Value>) {
-    let mut lockwise = lockwise_command("tests/window.toml", sql).stdout(Stdio::piped()).spawn().unwrap();
+    let mut lockwise = lockwise_command("tests/window.toml", "accounts", sql).stdout(Stdio::piped()).spawn().unwrap();
     let lines = BufReader::new(lockwise.stdout.take().unwrap()).lines();
     (lockwise, lines.map(|line| serde_json::from_str(&line.unwrap()).unwrap()))
 }
@@ -90,11 +90,11 @@ fn names(events: &[Value]) -> Vec<&str> {
     events.iter().map(|event| event["event"].as_str().unwrap()).collect()
 }
 
-fn column_exists(client: &mut Client, column: &str) -> bool {
+fn column_exists(client: &mut Client, table: &str, column: &str) -> bool {
     let columns: i64 = client
         .query_one(
-            "SELECT count(*) FROM information_schema.columns WHERE table_name = 'accounts' AND column_name = $1",
-            &[&column],
+            "SELECT count(*) FROM information_schema.columns WHERE table_name = $1 AND column_name = $2",
+            &[&table, &column],
         )
         .unwrap()
         .get(0);
@@ -115,7 +115,7 @@ fn waits_for_an_open_transaction_then_runs_the_ddl() {
 
     assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(names(&events(&output)), ["queued", "prelocked", "waiting", "acquired", "result"]);
-    assert!(column_exists(&mut client, "note"));
+    assert!(column_exists(&mut client, "accounts", "note"));
 }
 
 #[test]
@@ -134,7 +134,7 @@ fn gives_up_without_asking_for_the_strong_lock_when_the_transaction_never_ends()
     assert_eq!(names(&events), ["queued", "prelocked", "waiting", "result"]);
     assert_eq!(result["reason"], "long_blockers");
     assert_eq!(result["attempts"], 0);
-    assert!(!column_exists(&mut client, "note"));
+    assert!(!column_exists(&mut client, "accounts", "note"));
 }
 
 #[test]
@@ -158,7 +158,7 @@ fn retries_after_a_strong_lock_request_that_times_out() {
     assert_eq!(events[2]["cause"], "attempt_failed");
     assert_eq!(events[4]["cause"], "long_blockers");
     assert_eq!(events.last().unwrap()["attempts"], 2);
-    assert!(column_exists(&mut client, "note"));
+    assert!(column_exists(&mut client, "accounts", "note"));
 }
 
 #[test]
@@ -202,6 +202,53 @@ fn two_runs_on_the_same_table_take_turns_in_order_of_arrival() {
     assert!(first.wait().unwrap().success());
     assert!(second.wait().unwrap().success());
     assert!(first_acquired < second_acquired);
-    assert!(column_exists(&mut client, "note"));
-    assert!(column_exists(&mut client, "owner"));
+    assert!(column_exists(&mut client, "accounts", "note"));
+    assert!(column_exists(&mut client, "accounts", "owner"));
+}
+
+fn autovacuum_cancellations() -> usize {
+    let log = std::env::var("LOCKWISE_TEST_SERVER_LOG").expect("run the tests through tests/run.sh");
+    std::fs::read_to_string(log).unwrap().matches("canceling autovacuum task").count()
+}
+
+fn autovacuum_is_running_on_ledger(client: &mut Client) -> bool {
+    let workers: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE backend_type = 'autovacuum worker' AND query LIKE 'autovacuum: VACUUM %ledger%'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    workers == 1
+}
+
+#[test]
+fn the_weak_lock_moves_a_running_autovacuum_out_of_the_way() {
+    let mut client = connect();
+    // The cost settings make the autovacuum slow enough to still be running when the tool starts.
+    client
+        .batch_execute(
+            "DROP TABLE IF EXISTS ledger;
+             CREATE TABLE ledger (id int, pad text) WITH (
+               autovacuum_vacuum_threshold = 0, autovacuum_vacuum_scale_factor = 0,
+               autovacuum_vacuum_insert_threshold = -1, autovacuum_analyze_threshold = 2000000000,
+               autovacuum_vacuum_cost_delay = 100, autovacuum_vacuum_cost_limit = 1);
+             INSERT INTO ledger SELECT number, repeat('x', 200) FROM generate_series(1, 50000) AS number;
+             DELETE FROM ledger WHERE id % 2 = 0",
+        )
+        .unwrap();
+    while !autovacuum_is_running_on_ledger(&mut client) {
+        thread::sleep(Duration::from_millis(100));
+    }
+    let cancellations_before = autovacuum_cancellations();
+
+    let output = lockwise_command("tests/window.toml", "ledger", "ALTER TABLE ledger ADD COLUMN note text")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(names(&events(&output)), ["queued", "prelocked", "acquired", "result"]);
+    assert_eq!(autovacuum_cancellations(), cancellations_before + 1);
+    assert!(column_exists(&mut client, "ledger", "note"));
 }
