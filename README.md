@@ -1,26 +1,26 @@
 # lockwise
 
-Roda uma DDL em uma tabela quente do Postgres pausando a tabela uma vez só, por um tempo que você escolhe.
+Runs a DDL on a hot Postgres table and pauses the table only once, for a time you choose.
 
-É um binário que fala SQL comum com o servidor.
+It is a single binary that talks plain SQL to the server.
 
-> Estado atual: protótipo.
+> Current state: prototype.
 
-## O problema
+## The problem
 
-Uma DDL como `ALTER TABLE` precisa de um lock forte. Enquanto ela espera por esse lock, toda consulta nova na tabela fica parada atrás dela.
+A DDL such as `ALTER TABLE` needs a strong lock. While it waits for that lock, every new query on the table stops behind it.
 
-O jeito comum de lidar com isso é pedir o lock com um prazo curto e repetir. Em tabelas muito usadas isso falha. Cada pedido para a tabela um pouco, e depois de centenas de pedidos a migração desiste sem ter rodado.
+The usual answer is to ask for the lock with a short timeout and retry. On busy tables this fails. Each request stops the table for a moment, and after hundreds of requests the migration gives up without running.
 
-## Como o lockwise resolve
+## How lockwise solves it
 
-Ele faz três coisas, nesta ordem.
+It does three things, in this order.
 
-1. **Espera sem atrapalhar.** Pega primeiro um lock fraco, `SHARE UPDATE EXCLUSIVE`. Esse lock não bloqueia leitura nem escrita. Ele tira o autovacuum do caminho e põe as DDLs em fila.
-2. **Olha antes de pedir.** Vê quem está usando a tabela e há quanto tempo. Se há uma transação longa, espera ela terminar. A tabela segue funcionando.
-3. **Pede o lock forte uma vez, com prazo.** Se consegue, roda a DDL e libera. Se nunca aparece uma brecha, não pede, e diz quem está bloqueando.
+1. **Waits without getting in the way.** It first takes a weak lock, `SHARE UPDATE EXCLUSIVE`. This lock does not block reads or writes. It moves autovacuum out of the way and puts DDLs in a queue.
+2. **Looks before it asks.** It checks who is using the table and for how long. If there is a long transaction, it waits for it to end. The table keeps working.
+3. **Asks for the strong lock once, with a deadline.** If it gets the lock, it runs the DDL and releases. If a gap never shows up, it does not ask, and it tells you who is blocking.
 
-## Uso
+## Usage
 
 ```bash
 cargo build --release
@@ -32,45 +32,45 @@ target/release/lockwise run \
   --sql "ALTER TABLE accounts ADD COLUMN note text"
 ```
 
-O `--lock` recebe a tabela e o modo. Os modos são `ael` para `ACCESS EXCLUSIVE` e `sre` para `SHARE ROW EXCLUSIVE`.
+`--lock` takes the table and the mode. The modes are `ael` for `ACCESS EXCLUSIVE` and `sre` for `SHARE ROW EXCLUSIVE`.
 
-O usuário do banco precisa do role `pg_monitor`. A conexão deve ser direta, sem PgBouncer.
+The database user needs the `pg_monitor` role. Use a direct connection to Postgres.
 
-## Configuração
+## Configuration
 
-O preset é um arquivo TOML.
+The preset is a TOML file.
 
 ```toml
 name = "c1-window-3000ms"
-max_runtime_s = 120      # tempo total antes de desistir
+max_runtime_s = 120      # total time before giving up
 
 [window]
-max_pause_ms = 3000      # o máximo que a tabela pode ficar parada
-cooldown_ms = 10000      # intervalo entre tentativas
-poll_ms = 200            # cadência de observação
-prelock_hold_s = 60      # por quanto tempo segurar o lock fraco
+max_pause_ms = 3000      # the longest the table may be paused
+cooldown_ms = 10000      # time between attempts
+poll_ms = 200            # how often it looks at the blockers
+prelock_hold_s = 60      # how long it keeps the weak lock
 ```
 
-O valor que mais importa é `max_pause_ms`. Uma pausa menor causa menos dano, mas pode nunca encontrar uma brecha.
+The value that matters most is `max_pause_ms`. A shorter pause does less harm and needs a larger gap in traffic.
 
-## Saída
+## Output
 
-A ferramenta escreve um evento por linha, em JSON.
+The tool writes one JSON event per line.
 
-| Evento | Significado |
+| Event | Meaning |
 |---|---|
-| `queued` | Começou. |
-| `prelocked` | Pegou o lock fraco. |
-| `waiting` | Está esperando. Traz a lista de quem bloqueia. |
-| `acquired` | Pegou o lock forte. |
-| `result` | Terminou, com sucesso ou desistência. |
+| `queued` | Started. |
+| `prelocked` | Got the weak lock. |
+| `waiting` | Waiting. Lists who is blocking. |
+| `acquired` | Got the strong lock. |
+| `result` | Finished, with success or gave up. |
 
-O código de saída é `0` para sucesso, `2` para desistência e `1` para erro.
+The exit code is `0` for success, `2` for gave up and `1` for error.
 
-## Testes
+## Tests
 
 ```bash
 tests/run.sh
 ```
 
-O script sobe um Postgres descartável e roda os testes de ponta a ponta. Ele espera os binários do Postgres em `~/.local/share/mise/installs/postgres/17.8/bin`. Para usar outro lugar, defina `PG_ROOT` e `VER`.
+The script starts a throwaway Postgres and runs the end-to-end tests. It looks for the Postgres binaries in `~/.local/share/mise/installs/postgres/17.8/bin`. Set `PG_ROOT` and `VER` to use another location.
