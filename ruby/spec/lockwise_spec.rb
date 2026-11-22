@@ -38,6 +38,21 @@ RSpec.describe Lockwise do
     expect(column_exists?(connection, 'note')).to be(true)
   end
 
+  it 'lets reads and writes run while it waits on the weak lock' do
+    release, blocker = open_transaction_on_accounts
+    sleep 1
+    locker = lock_accounts_in_background('ALTER TABLE accounts ADD COLUMN note text', max_pause: 0.5, poll: 0.05)
+    sleep 0.05 until weak_lock_held?(connection)
+
+    connection.exec("SET lock_timeout = '200ms'")
+    connection.exec('INSERT INTO accounts VALUES (2)')
+    expect(connection.exec('SELECT count(*) FROM accounts').getvalue(0, 0)).to eq('2')
+
+    release.push(true)
+    [blocker, locker].each(&:join)
+    expect(column_exists?(connection, 'note')).to be(true)
+  end
+
   it 'gives up after a failed request when there is no time for another one' do
     release, blocker, blocker_pid = open_transaction_on_accounts
 

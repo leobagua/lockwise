@@ -34,6 +34,15 @@ module Database
     end
   end
 
+  # Runs Lockwise.with_lock on accounts in a thread, with its own connection.
+  def lock_accounts_in_background(statement, **options)
+    Thread.new do
+      background = connect
+      Lockwise.with_lock(background, 'accounts', **options) { background.exec(statement) }
+      background.close
+    end
+  end
+
   def weak_lock_held?(connection)
     sql = "SELECT count(*) FROM pg_locks WHERE relation = 'accounts'::regclass AND mode = 'ShareUpdateExclusiveLock'"
     connection.exec(sql).getvalue(0, 0) != '0'
