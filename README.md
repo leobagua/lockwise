@@ -14,7 +14,7 @@ DDL locks on busy tables can lead to lock contention.
 
 A DDL such as `ALTER TABLE` needs a strong lock. While it waits for that lock, every new query on the table queues behind it. On a busy table the queue grows fast, connections pile up and the application slows down or fails.
 
-The usual answer is to ask for the lock with a short timeout and retry, as `with_lock_retries` does in GitLab. Each request still stops the table for a moment. After hundreds of requests the migration gives up without running, and the contention happened anyway.
+The usual answer is to ask for the lock with a short timeout and retry. Each request still stops the table for a moment. After hundreds of requests the migration gives up without running, and the contention happened anyway.
 
 ![A DDL retries with a short lock timeout and fails every time](assets/retries.svg)
 
