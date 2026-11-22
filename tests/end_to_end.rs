@@ -39,6 +39,13 @@ fn open_transaction_on_accounts() -> (Sender<()>, JoinHandle<()>) {
     (release, handle)
 }
 
+fn release_after(release: Sender<()>, delay: Duration) -> JoinHandle<()> {
+    thread::spawn(move || {
+        thread::sleep(delay);
+        release.send(()).unwrap();
+    })
+}
+
 fn run_lockwise(preset: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_lockwise"))
         .args(["run", "--conn", &connection_string(), "--preset", preset])
@@ -72,10 +79,7 @@ fn waits_for_an_open_transaction_then_runs_the_ddl() {
     let (release, blocker) = open_transaction_on_accounts();
     // Lets the transaction grow older than max_pause_ms before the tool looks.
     thread::sleep(Duration::from_secs(1));
-    let releaser = thread::spawn(move || {
-        thread::sleep(Duration::from_secs(1));
-        release.send(()).unwrap();
-    });
+    let releaser = release_after(release, Duration::from_secs(1));
 
     let output = run_lockwise("tests/window.toml");
     releaser.join().unwrap();
@@ -103,4 +107,28 @@ fn gives_up_without_asking_for_the_strong_lock_when_the_transaction_never_ends()
     assert_eq!(result["reason"], "long_blockers");
     assert_eq!(result["attempts"], 0);
     assert!(!note_column_exists(&mut client));
+}
+
+#[test]
+fn retries_after_a_strong_lock_request_that_times_out() {
+    let mut client = create_accounts_table();
+    let (release, blocker) = open_transaction_on_accounts();
+    // The transaction is younger than max_pause_ms when the tool looks, so the
+    // tool asks for the strong lock, and the request times out.
+    let releaser = release_after(release, Duration::from_millis(1500));
+
+    let output = run_lockwise("tests/window.toml");
+    releaser.join().unwrap();
+    blocker.join().unwrap();
+
+    let events = events(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        names(&events),
+        ["queued", "prelocked", "waiting", "prelocked", "waiting", "acquired", "result"]
+    );
+    assert_eq!(events[2]["cause"], "attempt_failed");
+    assert_eq!(events[4]["cause"], "long_blockers");
+    assert_eq!(events.last().unwrap()["attempts"], 2);
+    assert!(note_column_exists(&mut client));
 }
