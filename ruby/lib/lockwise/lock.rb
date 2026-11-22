@@ -22,7 +22,21 @@ module Lockwise
       @poll = poll
     end
 
-    def run
+    def run(&)
+      refuse_open_transaction
+      in_transaction(&)
+    end
+
+    private
+
+    # The lock has to own its transaction, so that it can end it at any time.
+    def refuse_open_transaction
+      return if @connection.transaction_status == PG::PQTRANS_IDLE
+
+      raise TransactionOpenError, 'the connection is already in a transaction'
+    end
+
+    def in_transaction
       @connection.exec('BEGIN')
       take_weak_lock
       sleep(@poll) while long_transactions?
@@ -34,8 +48,6 @@ module Lockwise
       @connection.exec('ROLLBACK')
       raise
     end
-
-    private
 
     def take_weak_lock
       @connection.exec('SET LOCAL statement_timeout = 0')

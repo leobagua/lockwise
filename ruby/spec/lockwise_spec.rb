@@ -26,4 +26,15 @@ RSpec.describe Lockwise do
     expect(ran_at).to be > released_at
     expect(column_exists?(connection, 'note')).to be(true)
   end
+
+  it 'refuses a connection that is already in a transaction and leaves it open' do
+    connection.exec('BEGIN')
+    block_ran = false
+
+    expect { described_class.with_lock(connection, 'accounts') { block_ran = true } }
+      .to raise_error(Lockwise::TransactionOpenError)
+
+    expect(block_ran).to be(false)
+    expect(connection.transaction_status).to eq(PG::PQTRANS_INTRANS)
+  end
 end
