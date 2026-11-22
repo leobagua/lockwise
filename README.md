@@ -18,6 +18,24 @@ The usual answer is to ask for the lock with a short timeout and retry. Each req
 
 ![A DDL retries with a short lock timeout and fails every time](assets/retries.svg)
 
+## The idea, with a bridge
+
+Think of a bridge that needs a quick repair. The cars are the queries. The repair event is the DDL.
+
+To do the repair, the worker lowers the gate. No new car gets in, and he waits for the cars already on the bridge to leave. Then he performs the repair and reopens the bridge. Lowering the gate that blocks the bridge is the "strong lock".
+
+The problem is a slow truck in the middle of the bridge. That is a long transaction. If the worker lowers the gate while the truck is there, he needs to wait for the truck to pass. Meanwhile the cars pile up at the gate.
+
+The usual fix is to go to the entrance of the bridge and lower the gate. If a slow vehicle is still crossing and it takes too long, the worker raises the gate and returns later to try again. Every attempt piles up cars, and the truck is still there.
+
+lockwise does this instead.
+
+1. **The worker hangs a sign at the entrance, "maintenance scheduled".** The sign is the weak lock. Cars ignore it and keep crossing. The sign is for other maintenance crews. The street sweeper, which is autovacuum, leaves the bridge and stays away. Another worker with another repair waits for his turn.
+2. **He watches the bridge.** Is there a slow truck? Then he waits. Cars keep crossing.
+3. **When only fast cars are left, he lowers the gate.** The cars on the bridge leave in a moment. He performs the repair and reopens the bridge.
+
+The gate still goes down once. It stays down for a short time, because the worker chose the moment.
+
 ## How lockwise solves it
 
 ![lockwise waits on a weak lock and pauses the table once](assets/solution.svg)
