@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Starts a throwaway Postgres, runs the given command against it, and stops it.
-# Usage: tests/with_postgres.sh <command>...   VER=17.8 PG_ROOT=<dir with <version>/bin>
+# Usage: bin/with_postgres <command>...   VER=17.8 PG_ROOT=<dir with <version>/bin>
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 VER=${VER:-17.8}
 BIN=${PG_ROOT:-$HOME/.local/share/mise/installs/postgres}/$VER/bin
-RUN=$HERE/.run
+RUN=$(dirname "$HERE")/.run/test-postgres
 
 "$BIN/pg_ctl" -D "$RUN/data" -m immediate stop >/dev/null 2>&1 || true
 rm -rf "$RUN"

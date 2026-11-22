@@ -2,4 +2,4 @@
 # Runs the specs of the gem against a throwaway Postgres.
 set -eu
 cd "$(dirname "$0")/.."
-../tests/with_postgres.sh bundle exec rspec
+../bin/with_postgres bundle exec rspec

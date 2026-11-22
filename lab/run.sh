@@ -17,7 +17,7 @@ WARMUP=5
 BIN=${PG_ROOT:-$HOME/.local/share/mise/installs/postgres}/$VER/bin
 RUN=$HERE/.run/$VER
 RESULTS=$HERE/.run/results.tsv
-PRESET_FILE=$ROOT/presets/$PRESET.toml
+PRESET_FILE=$ROOT/rust/presets/$PRESET.toml
 MAX_RUNTIME=$(awk -F' *= *' '$1 == "max_runtime_s" { print $2 }' "$PRESET_FILE")
 PSQL=("$BIN/psql" -X -A -t -q -h "$RUN" -d lab)
 
@@ -122,7 +122,7 @@ SQL
   started=$(now)
   lock_flags=()
   for lock in $LOCKS; do lock_flags+=(--lock "$lock"); done
-  "${LOCKWISE:-$ROOT/target/release/lockwise}" run --conn "host=$RUN user=$DDL_USER dbname=lab" \
+  "${LOCKWISE:-$ROOT/rust/target/release/lockwise}" run --conn "host=$RUN user=$DDL_USER dbname=lab" \
     --preset "$PRESET_FILE" "${lock_flags[@]}" >"$out/events.jsonl" 2>"$out/lockwise.err"
   finished=$(now)
 

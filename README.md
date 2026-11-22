@@ -82,6 +82,7 @@ flowchart TD
 ## Usage
 
 ```bash
+cd rust
 cargo build --release
 
 target/release/lockwise run \
@@ -129,7 +130,8 @@ The exit code is `0` for success, `2` for gave up and `1` for error.
 ## Tests
 
 ```bash
-tests/run.sh
+rust/bin/test   # the binary
+ruby/bin/test   # the gem
 ```
 
-The script starts a throwaway Postgres and runs the end-to-end tests. It looks for the Postgres binaries in `~/.local/share/mise/installs/postgres/17.8/bin`. Set `PG_ROOT` and `VER` to use another location.
+Each script starts a throwaway Postgres and runs the tests against it. They look for the Postgres binaries in `~/.local/share/mise/installs/postgres/17.8/bin`. Set `PG_ROOT` and `VER` to use another location.
