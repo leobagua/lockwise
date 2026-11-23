@@ -120,17 +120,32 @@ pub fn table_oids(client: &mut Client, tables: &[String]) -> Result<Vec<u32>, po
 
 /// Runs the SQL with a lock_timeout, after an explicit ACCESS EXCLUSIVE when
 /// the job asks for one.
-pub fn lock_and_run(transaction: &mut Transaction, job: &Job, lock_timeout: Duration) -> Result<(), postgres::Error> {
-    transaction.batch_execute(&format!("SET LOCAL lock_timeout = '{}ms'", lock_timeout.as_millis()))?;
+pub fn lock_and_run(transaction: &mut Transaction, job: &Job, max_pause: Duration) -> Result<(), postgres::Error> {
     if job.access_exclusive {
-        for table in job.tables {
-            transaction.batch_execute(&format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))?;
-        }
+        take_access_exclusive(transaction, job.tables, max_pause)?;
+    } else {
+        limit_lock_wait(transaction, max_pause)?;
     }
     if let Some(sql) = job.sql {
         transaction.batch_execute(sql)?;
     }
     Ok(())
+}
+
+/// Locks the tables in the order given. The waits share one pause, so each
+/// table gets only the time the tables before it left.
+fn take_access_exclusive(transaction: &mut Transaction, tables: &[String], max_pause: Duration) -> Result<(), postgres::Error> {
+    let pause_ends_at = Instant::now() + max_pause;
+    for table in tables {
+        limit_lock_wait(transaction, pause_ends_at.saturating_duration_since(Instant::now()))?;
+        transaction.batch_execute(&format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))?;
+    }
+    Ok(())
+}
+
+/// Never zero, because Postgres reads a zero lock_timeout as no timeout.
+fn limit_lock_wait(transaction: &mut Transaction, wait: Duration) -> Result<(), postgres::Error> {
+    transaction.batch_execute(&format!("SET LOCAL lock_timeout = '{}ms'", wait.as_millis().max(1)))
 }
 
 fn try_once(client: &mut Client, job: &Job, lock_timeout: Duration) -> Result<AttemptEnd, postgres::Error> {

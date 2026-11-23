@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{channel, Sender};
+use std::sync::Once;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -17,7 +18,12 @@ fn connect() -> Client {
     Client::connect(&connection_string(), NoTls).unwrap()
 }
 
+static FIRST_RUN: Once = Once::new();
+
 fn create_accounts_table() -> Client {
+    // The first run of a new binary is slow on macOS. Some tests need the tool
+    // to start within max_pause_ms, so that run happens here.
+    FIRST_RUN.call_once(|| drop(Command::new(env!("CARGO_BIN_EXE_lockwise")).output()));
     let mut client = connect();
     client
         .batch_execute("DROP TABLE IF EXISTS accounts; CREATE TABLE accounts (id int PRIMARY KEY) WITH (autovacuum_enabled = false); INSERT INTO accounts VALUES (1)")
@@ -54,21 +60,22 @@ fn release_after(release: Sender<()>, delay: Duration) -> JoinHandle<()> {
     })
 }
 
-fn lockwise_command(preset: &str, table: &str, sql: &str) -> Command {
+fn lockwise_command(preset: &str, tables: &[&str], sql: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lockwise"));
-    command
-        .args(["run", "--conn", &connection_string(), "--preset", preset])
-        .args(["--table", table, "--sql", sql]);
+    command.args(["run", "--conn", &connection_string(), "--preset", preset, "--sql", sql]);
+    for table in tables {
+        command.args(["--table", table]);
+    }
     command
 }
 
 fn run_lockwise(preset: &str) -> Output {
-    lockwise_command(preset, "accounts", ADD_NOTE).output().unwrap()
+    lockwise_command(preset, &["accounts"], ADD_NOTE).output().unwrap()
 }
 
 /// Starts the tool in the background and returns it with its event lines.
 fn start_lockwise(sql: &str) -> (Child, impl Iterator<Item = Value>) {
-    let mut lockwise = lockwise_command("tests/window.toml", "accounts", sql).stdout(Stdio::piped()).spawn().unwrap();
+    let mut lockwise = lockwise_command("tests/window.toml", &["accounts"], sql).stdout(Stdio::piped()).spawn().unwrap();
     let lines = BufReader::new(lockwise.stdout.take().unwrap()).lines();
     (lockwise, lines.map(|line| serde_json::from_str(&line.unwrap()).unwrap()))
 }
@@ -249,7 +256,7 @@ fn the_weak_lock_moves_a_running_autovacuum_out_of_the_way() {
     }
     let cancellations_before = autovacuum_cancellations();
 
-    let output = lockwise_command("tests/window.toml", "ledger", "ALTER TABLE ledger ADD COLUMN note text")
+    let output = lockwise_command("tests/window.toml", &["ledger"], "ALTER TABLE ledger ADD COLUMN note text")
         .output()
         .unwrap();
 
@@ -276,7 +283,7 @@ fn the_sql_asks_for_its_own_lock_so_a_foreign_key_does_not_wait_for_a_reader() {
     create_accounts_with_owners();
     let (release, reader) = open_transaction("SELECT * FROM accounts");
 
-    let output = lockwise_command("tests/window.toml", "accounts", ADD_FOREIGN_KEY).output().unwrap();
+    let output = lockwise_command("tests/window.toml", &["accounts"], ADD_FOREIGN_KEY).output().unwrap();
     release.send(()).unwrap();
     reader.join().unwrap();
 
@@ -290,7 +297,7 @@ fn access_exclusive_is_taken_first_when_asked_for_so_the_foreign_key_waits_for_t
     let (release, reader) = open_transaction("SELECT * FROM accounts");
     let releaser = release_after(release, Duration::from_millis(1500));
 
-    let output = lockwise_command("tests/window.toml", "accounts", ADD_FOREIGN_KEY)
+    let output = lockwise_command("tests/window.toml", &["accounts"], ADD_FOREIGN_KEY)
         .arg("--access-exclusive")
         .output()
         .unwrap();
@@ -304,4 +311,59 @@ fn access_exclusive_is_taken_first_when_asked_for_so_the_foreign_key_waits_for_t
         ["queued", "prelocked", "waiting", "prelocked", "waiting", "acquired", "result"]
     );
     assert_eq!(events[2]["cause"], "attempt_failed");
+}
+
+#[test]
+fn waits_for_a_long_transaction_on_any_of_the_tables() {
+    create_accounts_with_owners();
+    let (release, reader) = open_transaction("SELECT * FROM owners");
+    thread::sleep(Duration::from_secs(1));
+    let releaser = release_after(release, Duration::from_secs(1));
+
+    let output = lockwise_command("tests/window.toml", &["owners", "accounts"], ADD_FOREIGN_KEY).output().unwrap();
+    releaser.join().unwrap();
+    reader.join().unwrap();
+
+    let events = events(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(names(&events), ["queued", "prelocked", "waiting", "acquired", "result"]);
+    assert_eq!(events[2]["cause"], "long_blockers");
+}
+
+fn access_exclusive_locks(client: &mut Client) -> Vec<(String, bool)> {
+    client
+        .query(
+            "SELECT relation::regclass::text, granted FROM pg_locks
+              WHERE mode = 'AccessExclusiveLock' AND relation IS NOT NULL
+              ORDER BY relation::regclass::text",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect()
+}
+
+#[test]
+fn access_exclusive_is_taken_in_the_order_given() {
+    create_accounts_with_owners();
+    let mut client = connect();
+    let (release, blocker) = open_transaction_on_accounts();
+
+    let mut lockwise = lockwise_command("tests/window-long-pause.toml", &["owners", "accounts"], "SELECT 1")
+        .arg("--access-exclusive")
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    while access_exclusive_locks(&mut client).len() < 2 {
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(
+        access_exclusive_locks(&mut client),
+        [("accounts".to_string(), false), ("owners".to_string(), true)]
+    );
+    release.send(()).unwrap();
+    blocker.join().unwrap();
+    assert!(lockwise.wait().unwrap().success());
 }
