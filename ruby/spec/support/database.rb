@@ -18,7 +18,7 @@ module Database
 
   # Opens a transaction that runs the given statement and stays open until
   # something is pushed to the returned queue. Also returns its backend pid.
-  def open_transaction_on_accounts(statement = ROW_LOCK)
+  def open_transaction(statement = ROW_LOCK)
     release = Queue.new
     started = Queue.new
     thread = Thread.new { hold_transaction(statement, started, release) }
@@ -34,18 +34,27 @@ module Database
     end
   end
 
-  # Runs Lockwise.with_lock on accounts in a thread, with its own connection.
+  # Runs Lockwise.with_lock in a thread, with its own connection.
   # The value of the thread is the time the statement ran.
-  def lock_accounts_in_background(statement, **options)
+  def lock_in_background(tables, statement, **options)
     Thread.new do
       background = connect
-      ran_at = Lockwise.with_lock(background, 'accounts', **options) do
+      ran_at = Lockwise.with_lock(background, tables, **options) do
         background.exec(statement)
         monotonic_now
       end
       background.close
       ran_at
     end
+  end
+
+  # Maps each table with an ACCESS EXCLUSIVE lock to whether it was granted.
+  def access_exclusive_locks(connection)
+    sql = <<~SQL
+      SELECT relation::regclass::text, granted FROM pg_locks
+       WHERE mode = 'AccessExclusiveLock' AND relation IS NOT NULL
+    SQL
+    connection.exec(sql).to_h { |row| [row['relation'], row['granted'] == 't'] }
   end
 
   def weak_lock_held?(connection)

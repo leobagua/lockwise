@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 module Lockwise
-  # Finds the sessions that hold locks on a table.
+  # Finds the sessions that hold locks on the tables.
   class Blockers
     WEAK_LOCK_CONFLICTS =
       '{ShareUpdateExclusiveLock,ShareLock,ShareRowExclusiveLock,ExclusiveLock,AccessExclusiveLock}'
@@ -16,7 +16,7 @@ module Lockwise
         FROM pg_locks
         JOIN pg_stat_activity ON pg_stat_activity.pid = pg_locks.pid
        WHERE pg_locks.locktype = 'relation'
-         AND pg_locks.relation = $1::regclass
+         AND pg_locks.relation = ANY($1::regclass[])
          AND pg_locks.granted
          AND pg_locks.pid <> pg_backend_pid()
          AND pg_locks.mode = ANY($2::text[])
@@ -25,9 +25,9 @@ module Lockwise
                 pg_stat_activity.backend_type, pg_stat_activity.xact_start
     SQL
 
-    def initialize(connection, table)
+    def initialize(connection, tables)
       @connection = connection
-      @table = table
+      @tables = PG::TextEncoder::Array.new.encode(tables)
     end
 
     def of_the_weak_lock
@@ -47,7 +47,7 @@ module Lockwise
     def find(modes, minimum_age)
       # Inside a transaction, pg_stat_activity is frozen at its first read.
       @connection.exec('SELECT pg_stat_clear_snapshot()')
-      @connection.exec_params(QUERY, [@table, modes, minimum_age]).map do |row|
+      @connection.exec_params(QUERY, [@tables, modes, minimum_age]).map do |row|
         Blocker.new(row['pid'].to_i, row['application_name'], row['backend_type'], row['age'].to_f)
       end
     end

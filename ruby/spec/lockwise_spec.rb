@@ -7,7 +7,7 @@ RSpec.describe Lockwise do
   after { connection.close }
 
   it 'waits for an open transaction to end, then runs the block' do
-    release, blocker = open_transaction_on_accounts
+    release, blocker = open_transaction
     sleep 1 # older than max_pause, so the lock has to wait for it
     releaser = release_after(release, 1)
 
@@ -23,7 +23,7 @@ RSpec.describe Lockwise do
   end
 
   it 'tries again after a strong lock request that times out' do
-    release, blocker = open_transaction_on_accounts
+    release, blocker = open_transaction
     releaser = release_after(release, 1.5) # still young when the lock looks, so the first request times out
 
     applied_at = []
@@ -39,9 +39,9 @@ RSpec.describe Lockwise do
   end
 
   it 'lets reads and writes run while it waits on the weak lock' do
-    release, blocker = open_transaction_on_accounts
+    release, blocker = open_transaction
     sleep 1
-    locker = lock_accounts_in_background('ALTER TABLE accounts ADD COLUMN note text', max_pause: 0.5, poll: 0.05)
+    locker = lock_in_background('accounts', 'ALTER TABLE accounts ADD COLUMN note text', max_pause: 0.5, poll: 0.05)
     sleep 0.05 until weak_lock_held?(connection)
 
     connection.exec("SET lock_timeout = '200ms'")
@@ -54,11 +54,11 @@ RSpec.describe Lockwise do
   end
 
   it 'makes two runs on the same table take turns, in order of arrival' do
-    release, blocker = open_transaction_on_accounts
+    release, blocker = open_transaction
     sleep 1
-    first = lock_accounts_in_background('ALTER TABLE accounts ADD COLUMN note text', max_pause: 0.5, poll: 0.05)
+    first = lock_in_background('accounts', 'ALTER TABLE accounts ADD COLUMN note text', max_pause: 0.5, poll: 0.05)
     sleep 0.05 until weak_lock_held?(connection)
-    second = lock_accounts_in_background('ALTER TABLE accounts ADD COLUMN owner text', max_pause: 0.5, poll: 0.05)
+    second = lock_in_background('accounts', 'ALTER TABLE accounts ADD COLUMN owner text', max_pause: 0.5, poll: 0.05)
     sleep 0.05 until weak_lock_waiting?(connection)
 
     release.push(true)
@@ -84,7 +84,7 @@ RSpec.describe Lockwise do
     end
 
     it 'lets the DDL ask for its own lock, so it does not wait for the reader' do
-      release, reader = open_transaction_on_accounts('SELECT * FROM accounts')
+      release, reader = open_transaction('SELECT * FROM accounts')
       releaser = release_after(release, 1.5)
 
       applied_at = add_foreign_key_at
@@ -94,7 +94,7 @@ RSpec.describe Lockwise do
     end
 
     it 'takes ACCESS EXCLUSIVE first when asked to, so it waits for the reader' do
-      release, reader = open_transaction_on_accounts('SELECT * FROM accounts')
+      release, reader = open_transaction('SELECT * FROM accounts')
       releaser = release_after(release, 1.5)
 
       applied_at = add_foreign_key_at(access_exclusive: true)
@@ -104,8 +104,40 @@ RSpec.describe Lockwise do
     end
   end
 
+  context 'with two tables' do
+    before do
+      connection.exec('DROP TABLE IF EXISTS owners')
+      connection.exec('CREATE TABLE owners (id int PRIMARY KEY)')
+      connection.exec('ALTER TABLE accounts ADD COLUMN owner_id int')
+    end
+
+    it 'waits for a long transaction on any of the tables' do
+      release, reader = open_transaction('SELECT * FROM owners')
+      sleep 1
+      releaser = release_after(release, 1)
+
+      applied_at = described_class.with_lock(connection, %w[owners accounts], max_pause: 0.5, poll: 0.05) do
+        connection.exec('ALTER TABLE accounts ADD FOREIGN KEY (owner_id) REFERENCES owners (id) NOT VALID')
+        monotonic_now
+      end
+      reader.join
+
+      expect(applied_at).to be > releaser.value
+    end
+
+    it 'takes ACCESS EXCLUSIVE in the order given' do
+      release, blocker = open_transaction
+      locker = lock_in_background(%w[owners accounts], 'SELECT 1', access_exclusive: true, max_pause: 5)
+      sleep 0.05 until access_exclusive_locks(connection).size == 2
+
+      expect(access_exclusive_locks(connection)).to eq('owners' => true, 'accounts' => false)
+      release.push(true)
+      [blocker, locker].each(&:join)
+    end
+  end
+
   it 'gives up after a failed request when there is no time for another one' do
-    release, blocker, blocker_pid = open_transaction_on_accounts
+    release, blocker, blocker_pid = open_transaction
 
     add_note = -> { connection.exec('ALTER TABLE accounts ADD COLUMN note text') }
     expect { described_class.with_lock(connection, 'accounts', max_pause: 0.5, cooldown: 1, max_runtime: 1, &add_note) }
@@ -120,7 +152,7 @@ RSpec.describe Lockwise do
   end
 
   it 'gives up and names the long transaction that never ends' do
-    release, blocker, blocker_pid = open_transaction_on_accounts
+    release, blocker, blocker_pid = open_transaction
     sleep 1
     block_ran = false
 
@@ -137,7 +169,7 @@ RSpec.describe Lockwise do
   end
 
   it 'gives up and names the session that holds the weak lock' do
-    release, blocker, blocker_pid = open_transaction_on_accounts(Database::WEAK_LOCK)
+    release, blocker, blocker_pid = open_transaction(Database::WEAK_LOCK)
 
     expect { described_class.with_lock(connection, 'accounts', max_runtime: 1) { nil } }
       .to raise_error(Lockwise::GaveUpError) { |error|

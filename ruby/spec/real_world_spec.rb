@@ -16,7 +16,7 @@ RSpec.describe Lockwise, 'under traffic' do
 
   it 'runs the DDL with one short pause while traffic and a long job use the table' do
     traffic.start
-    release, long_job = open_transaction_on_accounts
+    release, long_job = open_transaction
     sleep 1.2 # the long job is now older than max_pause
     releaser = release_after(release, 1.5)
 
