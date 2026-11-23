@@ -65,9 +65,37 @@ module Database
     weak_locks(connection, granted: false).positive?
   end
 
-  def column_exists?(connection, column)
-    sql = "SELECT count(*) FROM information_schema.columns WHERE table_name = 'accounts' AND column_name = $1"
-    connection.exec_params(sql, [column]).getvalue(0, 0) == '1'
+  def column_exists?(connection, column, table: 'accounts')
+    sql = 'SELECT count(*) FROM information_schema.columns WHERE table_name = $1 AND column_name = $2'
+    connection.exec_params(sql, [table, column]).getvalue(0, 0) == '1'
+  end
+
+  # The cost settings make the autovacuum slow enough to still be running
+  # when the lock starts.
+  def create_ledger_table_with_a_slow_autovacuum(connection)
+    connection.exec('SET client_min_messages = warning')
+    connection.exec('DROP TABLE IF EXISTS ledger')
+    connection.exec(<<~SQL)
+      CREATE TABLE ledger (id int, pad text) WITH (
+        autovacuum_vacuum_threshold = 0, autovacuum_vacuum_scale_factor = 0,
+        autovacuum_vacuum_insert_threshold = -1, autovacuum_analyze_threshold = 2000000000,
+        autovacuum_vacuum_cost_delay = 100, autovacuum_vacuum_cost_limit = 1)
+    SQL
+    connection.exec("INSERT INTO ledger SELECT number, repeat('x', 200) FROM generate_series(1, 50000) AS number")
+    connection.exec('DELETE FROM ledger WHERE id % 2 = 0')
+  end
+
+  def autovacuum_running_on_ledger?(connection)
+    sql = <<~SQL
+      SELECT count(*) FROM pg_stat_activity
+       WHERE backend_type = 'autovacuum worker' AND query LIKE 'autovacuum: VACUUM %ledger%'
+    SQL
+    connection.exec(sql).getvalue(0, 0) == '1'
+  end
+
+  def autovacuum_cancellations
+    log = ENV.fetch('LOCKWISE_TEST_SERVER_LOG') { raise 'run the specs through bin/test' }
+    File.read(log).scan('canceling autovacuum task').size
   end
 
   def monotonic_now
