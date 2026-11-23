@@ -2,6 +2,7 @@
 
 require_relative 'lockwise/version'
 require_relative 'lockwise/errors'
+require_relative 'lockwise/adapters'
 require_relative 'lockwise/blockers'
 require_relative 'lockwise/lock'
 

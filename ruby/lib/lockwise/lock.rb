@@ -8,13 +8,15 @@ module Lockwise
   class Lock
     # Ends the transaction and starts again from the weak lock. The message is the reason.
     class StartOver < StandardError; end
-    private_constant :StartOver
+    # Ends the transaction for good. The message is the reason.
+    class GiveUp < StandardError; end
+    private_constant :StartOver, :GiveUp
 
     def initialize(connection, tables, access_exclusive: false, max_pause: 3.0, poll: 0.2,
                    cooldown: 10.0, weak_lock_hold: 60.0, max_runtime: 120.0)
-      @connection = connection
+      @connection = Adapters.for(connection)
       @tables = Array(tables)
-      @blockers = Blockers.new(connection, @tables, max_pause)
+      @blockers = Blockers.new(@connection, @tables, max_pause)
       @access_exclusive = access_exclusive
       @max_pause = max_pause
       @poll = poll
@@ -26,42 +28,42 @@ module Lockwise
     def run(&)
       refuse_open_transaction
       @deadline = monotonic_now + @max_runtime
-      begin
-        in_transaction(&)
-      rescue StartOver => e
-        give_up(e.message) if monotonic_now + @cooldown >= @deadline
-        sleep(@cooldown)
-        retry
-      end
+      attempt(&)
     end
 
     private
 
+    def attempt(&)
+      @connection.transaction { lock_and_run(&) }
+    rescue StartOver => e
+      raise gave_up(e.message) if monotonic_now + @cooldown >= @deadline
+
+      sleep(@cooldown)
+      retry
+    rescue GiveUp => e
+      raise gave_up(e.message)
+    end
+
     # The lock has to own its transaction, so that it can end it at any time.
     def refuse_open_transaction
-      return if idle?
+      return if @connection.idle?
 
       raise TransactionOpenError, 'the connection is already in a transaction'
     end
 
-    def in_transaction(&)
-      @connection.exec('BEGIN')
-      give_up('prelock_timeout') unless take_weak_lock
+    def lock_and_run(&)
+      raise GiveUp, 'prelock_timeout' unless take_weak_lock
+
       wait_for_long_transactions
-      result = with_lock_timeout(&)
-      @connection.exec('COMMIT')
-      result
-    rescue StandardError
-      @connection.exec('ROLLBACK') unless idle?
-      raise
+      with_lock_timeout(&)
     end
 
     def take_weak_lock
-      @connection.exec('SET LOCAL statement_timeout = 0')
+      @connection.execute('SET LOCAL statement_timeout = 0')
       limit_lock_wait(@deadline - monotonic_now)
-      @connection.exec("LOCK TABLE #{quoted(tables_in_a_stable_order).join(', ')} IN SHARE UPDATE EXCLUSIVE MODE")
+      @connection.execute("LOCK TABLE #{quoted(tables_in_a_stable_order).join(', ')} IN SHARE UPDATE EXCLUSIVE MODE")
       true
-    rescue PG::LockNotAvailable
+    rescue *@connection.lock_timeout_errors
       false
     end
 
@@ -70,7 +72,7 @@ module Lockwise
     def wait_for_long_transactions
       release_weak_lock_at = monotonic_now + @weak_lock_hold
       until @blockers.long_transactions.empty?
-        give_up('long_blockers') if monotonic_now >= @deadline
+        raise GiveUp, 'long_blockers' if monotonic_now >= @deadline
         raise StartOver, 'long_blockers' if monotonic_now >= release_weak_lock_at
 
         sleep(@poll)
@@ -84,7 +86,7 @@ module Lockwise
         limit_lock_wait(@max_pause)
       end
       yield
-    rescue PG::LockNotAvailable
+    rescue *@connection.lock_timeout_errors
       # A failed request for ACCESS EXCLUSIVE leaves an xid on the transaction,
       # so the whole transaction ends before the next attempt.
       raise StartOver, 'attempt_failed'
@@ -96,7 +98,7 @@ module Lockwise
       pause_ends_at = monotonic_now + @max_pause
       quoted(@tables).each do |table|
         limit_lock_wait(pause_ends_at - monotonic_now)
-        @connection.exec("LOCK TABLE #{table} IN ACCESS EXCLUSIVE MODE")
+        @connection.execute("LOCK TABLE #{table} IN ACCESS EXCLUSIVE MODE")
       end
     end
 
@@ -104,22 +106,17 @@ module Lockwise
     # that they queue instead of deadlocking.
     def tables_in_a_stable_order
       sql = 'SELECT name FROM unnest($1::text[]) AS name ORDER BY name::regclass::oid'
-      @connection.exec_params(sql, [PG::TextEncoder::Array.new.encode(@tables)]).column_values(0)
+      @connection.select(sql, [PG::TextEncoder::Array.new.encode(@tables)]).map { |row| row['name'] }
     end
 
-    # Looks for the blockers after the transaction has ended.
-    def give_up(reason)
-      @connection.exec('ROLLBACK') unless idle?
-      raise GaveUpError.new(reason, @blockers.behind(reason))
-    end
-
-    def idle?
-      @connection.transaction_status == PG::PQTRANS_IDLE
+    # Called after the transaction has ended, so the blockers are looked up outside it.
+    def gave_up(reason)
+      GaveUpError.new(reason, @blockers.behind(reason))
     end
 
     # Never zero, because Postgres reads a zero lock_timeout as no timeout.
     def limit_lock_wait(seconds)
-      @connection.exec("SET LOCAL lock_timeout = '#{[(seconds * 1000).round, 1].max}ms'")
+      @connection.execute("SET LOCAL lock_timeout = '#{[(seconds * 1000).round, 1].max}ms'")
     end
 
     def monotonic_now
@@ -127,7 +124,7 @@ module Lockwise
     end
 
     def quoted(tables)
-      tables.map { |table| @connection.quote_ident(table) }
+      tables.map { |table| @connection.quote(table) }
     end
   end
 end
