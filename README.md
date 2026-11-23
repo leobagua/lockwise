@@ -61,6 +61,32 @@ flowchart TD
     release --> weak
 ```
 
+## What the weak lock blocks
+
+The weak lock is `SHARE UPDATE EXCLUSIVE`. It conflicts with itself and with every stronger lock. The locks that traffic uses are weaker, so traffic passes.
+
+These run while lockwise holds the weak lock.
+
+| Operation | Lock it uses |
+|---|---|
+| `SELECT`, `COPY TO`, `pg_dump` | `ACCESS SHARE` |
+| `REFRESH MATERIALIZED VIEW CONCURRENTLY` of a view that reads the table | `ACCESS SHARE` |
+| `SELECT ... FOR UPDATE` | `ROW SHARE` |
+| `INSERT`, `UPDATE`, `DELETE`, `MERGE` | `ROW EXCLUSIVE` |
+
+These wait until lockwise releases the weak lock.
+
+| Operation | Lock it uses |
+|---|---|
+| `VACUUM`, `ANALYZE` | `SHARE UPDATE EXCLUSIVE` |
+| `CREATE INDEX CONCURRENTLY`, `REINDEX CONCURRENTLY`, `DROP INDEX CONCURRENTLY` | `SHARE UPDATE EXCLUSIVE` |
+| `VALIDATE CONSTRAINT`, `CREATE STATISTICS` | `SHARE UPDATE EXCLUSIVE` |
+| `CREATE INDEX` | `SHARE` |
+| `CREATE TRIGGER`, adding a foreign key | `SHARE ROW EXCLUSIVE` |
+| `ALTER TABLE ADD COLUMN`, `TRUNCATE`, `DROP TABLE`, `VACUUM FULL`, `CLUSTER`, `REINDEX TABLE` | `ACCESS EXCLUSIVE` |
+
+A regular autovacuum does not wait. It skips the table. The DDL that lockwise runs is not blocked either, because it runs in the transaction that holds the weak lock.
+
 ## Advantages
 
 - **The wait uses no XID.** A transaction that holds only the weak lock has no transaction ID. It does not hold back the vacuum horizon.
