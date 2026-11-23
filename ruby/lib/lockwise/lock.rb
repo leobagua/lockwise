@@ -1,37 +1,20 @@
 # frozen_string_literal: true
 
 module Lockwise
-  # Waits on a weak lock until no long transaction uses the table, then takes
-  # ACCESS EXCLUSIVE once and yields inside the same transaction.
+  # Waits on a weak lock until no long transaction uses the table, then yields
+  # inside the same transaction with a lock_timeout. The DDL in the block asks
+  # for the lock it needs. The block runs again if that request times out.
+  # With access_exclusive: true, ACCESS EXCLUSIVE is taken before the block runs.
   class Lock
-    WEAK_LOCK_CONFLICTS =
-      '{ShareUpdateExclusiveLock,ShareLock,ShareRowExclusiveLock,ExclusiveLock,AccessExclusiveLock}'
-    STRONG_LOCK_CONFLICTS =
-      "{AccessShareLock,RowShareLock,RowExclusiveLock,#{WEAK_LOCK_CONFLICTS.delete('{}')}}".freeze
-
-    BLOCKERS = <<~SQL
-      SELECT pg_stat_activity.pid,
-             pg_stat_activity.application_name,
-             pg_stat_activity.backend_type,
-             extract(epoch FROM clock_timestamp() - pg_stat_activity.xact_start) AS age
-        FROM pg_locks
-        JOIN pg_stat_activity ON pg_stat_activity.pid = pg_locks.pid
-       WHERE pg_locks.locktype = 'relation'
-         AND pg_locks.relation = $1::regclass
-         AND pg_locks.granted
-         AND pg_locks.pid <> pg_backend_pid()
-         AND pg_locks.mode = ANY($2::text[])
-         AND pg_stat_activity.xact_start <= clock_timestamp() - make_interval(secs => $3)
-       GROUP BY pg_stat_activity.pid, pg_stat_activity.application_name,
-                pg_stat_activity.backend_type, pg_stat_activity.xact_start
-    SQL
-
     class AttemptFailed < StandardError; end
     private_constant :AttemptFailed
 
-    def initialize(connection, table, max_pause: 3.0, poll: 0.2, cooldown: 10.0, max_runtime: 120.0)
+    def initialize(connection, table, access_exclusive: false,
+                   max_pause: 3.0, poll: 0.2, cooldown: 10.0, max_runtime: 120.0)
       @connection = connection
       @table = table
+      @blockers = Blockers.new(connection, table)
+      @access_exclusive = access_exclusive
       @max_pause = max_pause
       @poll = poll
       @cooldown = cooldown
@@ -44,7 +27,7 @@ module Lockwise
       begin
         in_transaction(&)
       rescue AttemptFailed
-        give_up('attempt_failed', STRONG_LOCK_CONFLICTS, 0) if monotonic_now + @cooldown >= @deadline
+        give_up('attempt_failed') { @blockers.of_any_lock } if monotonic_now + @cooldown >= @deadline
         sleep(@cooldown)
         retry
       end
@@ -59,12 +42,11 @@ module Lockwise
       raise TransactionOpenError, 'the connection is already in a transaction'
     end
 
-    def in_transaction
+    def in_transaction(&)
       @connection.exec('BEGIN')
-      give_up('prelock_timeout', WEAK_LOCK_CONFLICTS, 0) unless take_weak_lock
-      give_up('long_blockers', STRONG_LOCK_CONFLICTS, @max_pause) unless wait_for_long_transactions
-      take_strong_lock
-      result = yield
+      give_up('prelock_timeout') { @blockers.of_the_weak_lock } unless take_weak_lock
+      give_up('long_blockers') { @blockers.older_than(@max_pause) } unless wait_for_long_transactions
+      result = with_lock_timeout(&)
       @connection.exec('COMMIT')
       result
     rescue StandardError
@@ -83,33 +65,27 @@ module Lockwise
 
     def wait_for_long_transactions
       loop do
-        return true if blockers(STRONG_LOCK_CONFLICTS, @max_pause).empty?
+        return true if @blockers.older_than(@max_pause).empty?
         return false if monotonic_now >= @deadline
 
         sleep(@poll)
       end
     end
 
-    def take_strong_lock
+    def with_lock_timeout
       @connection.exec("SET LOCAL lock_timeout = '#{milliseconds(@max_pause)}ms'")
-      @connection.exec("LOCK TABLE #{quoted_table} IN ACCESS EXCLUSIVE MODE")
+      @connection.exec("LOCK TABLE #{quoted_table} IN ACCESS EXCLUSIVE MODE") if @access_exclusive
+      yield
     rescue PG::LockNotAvailable
       # A failed request for ACCESS EXCLUSIVE leaves an xid on the transaction,
       # so the whole transaction ends before the next attempt.
       raise AttemptFailed
     end
 
-    def give_up(reason, modes, minimum_age)
+    # The block finds the blockers, and it runs after the transaction has ended.
+    def give_up(reason)
       @connection.exec('ROLLBACK') unless idle?
-      raise GaveUpError.new(reason, blockers(modes, minimum_age))
-    end
-
-    def blockers(modes, minimum_age)
-      # Inside a transaction, pg_stat_activity is frozen at its first read.
-      @connection.exec('SELECT pg_stat_clear_snapshot()')
-      @connection.exec_params(BLOCKERS, [@table, modes, minimum_age]).map do |row|
-        Blocker.new(row['pid'].to_i, row['application_name'], row['backend_type'], row['age'].to_f)
-      end
+      raise GaveUpError.new(reason, yield)
     end
 
     def idle?

@@ -26,15 +26,15 @@ RSpec.describe Lockwise do
     release, blocker = open_transaction_on_accounts
     releaser = release_after(release, 1.5) # still young when the lock looks, so the first request times out
 
-    ran_at = []
+    applied_at = []
     described_class.with_lock(connection, 'accounts', max_pause: 0.5, poll: 0.05, cooldown: 0.2) do
-      ran_at << monotonic_now
       connection.exec('ALTER TABLE accounts ADD COLUMN note text')
+      applied_at << monotonic_now
     end
     blocker.join
 
-    expect(ran_at.size).to eq(1)
-    expect(ran_at.first).to be > releaser.value
+    expect(applied_at.size).to eq(1)
+    expect(applied_at.first).to be > releaser.value
     expect(column_exists?(connection, 'note')).to be(true)
   end
 
@@ -69,10 +69,46 @@ RSpec.describe Lockwise do
     expect(column_exists?(connection, 'owner')).to be(true)
   end
 
+  context 'when a foreign key is added while a reader is open' do
+    before do
+      connection.exec('DROP TABLE IF EXISTS owners')
+      connection.exec('CREATE TABLE owners (id int PRIMARY KEY)')
+      connection.exec('ALTER TABLE accounts ADD COLUMN owner_id int')
+    end
+
+    def add_foreign_key_at(**options)
+      described_class.with_lock(connection, 'accounts', max_pause: 0.5, poll: 0.05, cooldown: 0.2, **options) do
+        connection.exec('ALTER TABLE accounts ADD FOREIGN KEY (owner_id) REFERENCES owners (id) NOT VALID')
+        monotonic_now
+      end
+    end
+
+    it 'lets the DDL ask for its own lock, so it does not wait for the reader' do
+      release, reader = open_transaction_on_accounts('SELECT * FROM accounts')
+      releaser = release_after(release, 1.5)
+
+      applied_at = add_foreign_key_at
+      reader.join
+
+      expect(applied_at).to be < releaser.value
+    end
+
+    it 'takes ACCESS EXCLUSIVE first when asked to, so it waits for the reader' do
+      release, reader = open_transaction_on_accounts('SELECT * FROM accounts')
+      releaser = release_after(release, 1.5)
+
+      applied_at = add_foreign_key_at(access_exclusive: true)
+      reader.join
+
+      expect(applied_at).to be > releaser.value
+    end
+  end
+
   it 'gives up after a failed request when there is no time for another one' do
     release, blocker, blocker_pid = open_transaction_on_accounts
 
-    expect { described_class.with_lock(connection, 'accounts', max_pause: 0.5, cooldown: 1, max_runtime: 1) { nil } }
+    add_note = -> { connection.exec('ALTER TABLE accounts ADD COLUMN note text') }
+    expect { described_class.with_lock(connection, 'accounts', max_pause: 0.5, cooldown: 1, max_runtime: 1, &add_note) }
       .to raise_error(Lockwise::GaveUpError) { |error|
         expect(error.reason).to eq('attempt_failed')
         expect(error.blockers.map(&:pid)).to eq([blocker_pid])
