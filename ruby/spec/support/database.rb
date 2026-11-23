@@ -48,13 +48,10 @@ module Database
     end
   end
 
-  # Maps each table with an ACCESS EXCLUSIVE lock to whether it was granted.
-  def access_exclusive_locks(connection)
-    sql = <<~SQL
-      SELECT relation::regclass::text, granted FROM pg_locks
-       WHERE mode = 'AccessExclusiveLock' AND relation IS NOT NULL
-    SQL
-    connection.exec(sql).to_h { |row| [row['relation'], row['granted'] == 't'] }
+  # Maps each table with a lock in the given mode to whether it was granted.
+  def locks_in_mode(connection, mode)
+    sql = 'SELECT relation::regclass::text, granted FROM pg_locks WHERE mode = $1 AND relation IS NOT NULL'
+    connection.exec_params(sql, [mode]).to_h { |row| [row['relation'], row['granted'] == 't'] }
   end
 
   def weak_lock_held?(connection)

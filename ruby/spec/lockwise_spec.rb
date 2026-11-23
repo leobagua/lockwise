@@ -93,6 +93,16 @@ RSpec.describe Lockwise do
       expect(applied_at).to be < releaser.value
     end
 
+    it 'does not wait for the reader with SHARE ROW EXCLUSIVE taken first' do
+      release, reader = open_transaction('SELECT * FROM accounts')
+      releaser = release_after(release, 1.5)
+
+      applied_at = add_foreign_key_at(share_row_exclusive: true)
+      reader.join
+
+      expect(applied_at).to be < releaser.value
+    end
+
     it 'takes ACCESS EXCLUSIVE first when asked to, so it waits for the reader' do
       release, reader = open_transaction('SELECT * FROM accounts')
       releaser = release_after(release, 1.5)
@@ -128,11 +138,26 @@ RSpec.describe Lockwise do
     it 'takes ACCESS EXCLUSIVE in the order given' do
       release, blocker = open_transaction
       locker = lock_in_background(%w[owners accounts], 'SELECT 1', access_exclusive: true, max_pause: 5)
-      sleep 0.05 until access_exclusive_locks(connection).size == 2
+      sleep 0.05 until locks_in_mode(connection, 'AccessExclusiveLock').size == 2
 
-      expect(access_exclusive_locks(connection)).to eq('owners' => true, 'accounts' => false)
+      expect(locks_in_mode(connection, 'AccessExclusiveLock')).to eq('owners' => true, 'accounts' => false)
       release.push(true)
       [blocker, locker].each(&:join)
+    end
+
+    it 'takes SHARE ROW EXCLUSIVE in the order given' do
+      release, blocker = open_transaction
+      locker = lock_in_background(%w[owners accounts], 'SELECT 1', share_row_exclusive: true, max_pause: 5)
+      sleep 0.05 until locks_in_mode(connection, 'ShareRowExclusiveLock').size == 2
+
+      expect(locks_in_mode(connection, 'ShareRowExclusiveLock')).to eq('owners' => true, 'accounts' => false)
+      release.push(true)
+      [blocker, locker].each(&:join)
+    end
+
+    it 'refuses both explicit locks at once' do
+      expect { described_class.with_lock(connection, 'accounts', access_exclusive: true, share_row_exclusive: true) }
+        .to raise_error(ArgumentError)
     end
   end
 

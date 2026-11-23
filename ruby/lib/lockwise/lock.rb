@@ -4,7 +4,8 @@ module Lockwise
   # Waits on a weak lock until no long transaction uses the tables, then yields
   # inside the same transaction with a lock_timeout. The DDL in the block asks
   # for the lock it needs. The block runs again if that request times out.
-  # With access_exclusive: true, ACCESS EXCLUSIVE is taken before the block runs.
+  # With access_exclusive: true or share_row_exclusive: true, that lock is
+  # taken before the block runs, on the tables in the order given.
   class Lock
     # Ends the transaction and starts again from the weak lock. The message is the reason.
     class StartOver < StandardError; end
@@ -12,12 +13,12 @@ module Lockwise
     class GiveUp < StandardError; end
     private_constant :StartOver, :GiveUp
 
-    def initialize(connection, tables, access_exclusive: false, max_pause: 3.0, poll: 0.2,
-                   cooldown: 10.0, weak_lock_hold: 60.0, max_runtime: 120.0)
+    def initialize(connection, tables, access_exclusive: false, share_row_exclusive: false,
+                   max_pause: 3.0, poll: 0.2, cooldown: 10.0, weak_lock_hold: 60.0, max_runtime: 120.0)
       @connection = Adapters.for(connection)
       @tables = Array(tables)
       @blockers = Blockers.new(@connection, @tables, max_pause)
-      @access_exclusive = access_exclusive
+      @explicit_lock = explicit_lock(access_exclusive, share_row_exclusive)
       @max_pause = max_pause
       @poll = poll
       @cooldown = cooldown
@@ -80,8 +81,8 @@ module Lockwise
     end
 
     def with_lock_timeout
-      if @access_exclusive
-        take_access_exclusive
+      if @explicit_lock
+        take_explicit_lock
       else
         limit_lock_wait(@max_pause)
       end
@@ -94,12 +95,22 @@ module Lockwise
 
     # Locks the tables in the order given. The waits share one pause, so each
     # table gets only the time the tables before it left.
-    def take_access_exclusive
+    def take_explicit_lock
       pause_ends_at = monotonic_now + @max_pause
       quoted(@tables).each do |table|
         limit_lock_wait(pause_ends_at - monotonic_now)
-        @connection.execute("LOCK TABLE #{table} IN ACCESS EXCLUSIVE MODE")
+        @connection.execute("LOCK TABLE #{table} IN #{@explicit_lock} MODE")
       end
+    end
+
+    def explicit_lock(access_exclusive, share_row_exclusive)
+      if access_exclusive && share_row_exclusive
+        raise ArgumentError, 'choose access_exclusive or share_row_exclusive, not both'
+      end
+
+      return 'ACCESS EXCLUSIVE' if access_exclusive
+
+      'SHARE ROW EXCLUSIVE' if share_row_exclusive
     end
 
     # Two runs that share tables take the weak locks in the same order, so
