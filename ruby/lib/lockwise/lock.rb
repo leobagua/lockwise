@@ -56,10 +56,14 @@ module Lockwise
       raise GiveUp, 'prelock_timeout' unless take_weak_lock
 
       wait_for_long_transactions
+      @connection.execute("SET LOCAL statement_timeout = '#{@statement_timeout}'")
       with_lock_timeout(&)
     end
 
+    # The wait for the weak lock has no time limit of its own, so the
+    # statement_timeout is off until the block is about to run.
     def take_weak_lock
+      @statement_timeout = @connection.select('SHOW statement_timeout', []).first['statement_timeout']
       @connection.execute('SET LOCAL statement_timeout = 0')
       limit_lock_wait(@deadline - monotonic_now)
       @connection.execute("LOCK TABLE #{quoted(tables_in_a_stable_order).join(', ')} IN SHARE UPDATE EXCLUSIVE MODE")

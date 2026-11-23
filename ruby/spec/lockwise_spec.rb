@@ -176,6 +176,19 @@ RSpec.describe Lockwise do
     expect(column_exists?(connection, 'note')).to be(true)
   end
 
+  it 'waits without the statement_timeout and gives it back to the block' do
+    connection.exec("SET statement_timeout = '700ms'")
+    release, holder = open_transaction(Database::WEAK_LOCK)
+    release_after(release, 1.5)
+
+    inside_the_block = described_class.with_lock(connection, 'accounts') do
+      connection.exec('SHOW statement_timeout').getvalue(0, 0)
+    end
+    holder.join
+
+    expect(inside_the_block).to eq('700ms')
+  end
+
   it 'gives up after a failed request when there is no time for another one' do
     release, blocker, blocker_pid = open_transaction
 
