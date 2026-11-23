@@ -81,9 +81,9 @@ fn cycle(
     let release_weak_lock_at = Instant::now() + Duration::from_secs(window.prelock_hold_s);
     let mut transaction = ddl.transaction()?;
 
-    if !take_weak_lock(&mut transaction, job.tables, oids, deadline)? {
+    let Some(statement_timeout) = take_weak_lock(&mut transaction, job.tables, oids, deadline)? else {
         return Ok(Cycle::Again { cause: "prelock_timeout" });
-    }
+    };
     emit("prelocked", json!({}));
 
     while Instant::now() < deadline.min(release_weak_lock_at) {
@@ -98,6 +98,7 @@ fn cycle(
         }
 
         *attempts += 1;
+        transaction.batch_execute(&format!("SET LOCAL statement_timeout = '{statement_timeout}'"))?;
         let attempt_started = Instant::now();
         let waited_ms = |started: Instant| started.elapsed().as_millis() as u64;
         return match lock_and_run(&mut transaction, job, max_pause) {
@@ -120,14 +121,18 @@ fn cycle(
     Ok(Cycle::Again { cause: "long_blockers" })
 }
 
+/// The wait for the weak lock has no time limit of its own, so the
+/// statement_timeout is turned off. Returns the session value, to be given
+/// back before the SQL runs, or None when the weak lock was not granted.
 fn take_weak_lock(
     transaction: &mut Transaction,
     tables: &[String],
     oids: &[u32],
     deadline: Instant,
-) -> Result<bool, postgres::Error> {
+) -> Result<Option<String>, postgres::Error> {
     let mut by_oid: Vec<(&u32, &String)> = oids.iter().zip(tables).collect();
     by_oid.sort_by_key(|(oid, _)| **oid);
+    let statement_timeout: String = transaction.query_one("SHOW statement_timeout", &[])?.get(0);
 
     transaction.batch_execute(&format!(
         "SET LOCAL statement_timeout = 0;
@@ -138,10 +143,10 @@ fn take_weak_lock(
     for (_, table) in by_oid {
         let locked = transaction.batch_execute(&format!("LOCK TABLE {table} IN SHARE UPDATE EXCLUSIVE MODE"));
         if let Err(error) = locked {
-            return if retryable_cause(&error).is_some() { Ok(false) } else { Err(error) };
+            return if retryable_cause(&error).is_some() { Ok(None) } else { Err(error) };
         }
     }
-    Ok(true)
+    Ok(Some(statement_timeout))
 }
 
 /// Every session with a lock on the tables. The lock the SQL will ask for is

@@ -92,7 +92,7 @@ target/release/lockwise run \
   --sql "ALTER TABLE accounts ADD COLUMN note text"
 ```
 
-`--table` names the table the SQL changes. The SQL asks for the lock it needs. Add `--access-exclusive` to take `ACCESS EXCLUSIVE` on the table before the SQL runs.
+`--table` names the table the SQL changes. The SQL asks for the lock it needs. Add `--access-exclusive` or `--share-row-exclusive` to take that lock before the SQL runs, on the tables in the order given.
 
 The database user needs the `pg_monitor` role. Use a direct connection to Postgres.
 

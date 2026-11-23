@@ -11,9 +11,9 @@ pub struct Job<'a> {
     pub connection: &'a str,
     pub preset: &'a Preset,
     pub tables: &'a [String],
-    /// Takes ACCESS EXCLUSIVE on the tables before the SQL runs. Without it
-    /// the SQL asks for the lock it needs.
-    pub access_exclusive: bool,
+    /// The lock mode to take on the tables before the SQL runs. Without it the
+    /// SQL asks for the lock it needs.
+    pub explicit_lock: Option<&'static str>,
     pub sql: Option<&'a str>,
 }
 
@@ -118,13 +118,12 @@ pub fn table_oids(client: &mut Client, tables: &[String]) -> Result<Vec<u32>, po
         .collect()
 }
 
-/// Runs the SQL with a lock_timeout, after an explicit ACCESS EXCLUSIVE when
-/// the job asks for one.
+/// Runs the SQL with a lock_timeout, after an explicit lock when the job
+/// asks for one.
 pub fn lock_and_run(transaction: &mut Transaction, job: &Job, max_pause: Duration) -> Result<(), postgres::Error> {
-    if job.access_exclusive {
-        take_access_exclusive(transaction, job.tables, max_pause)?;
-    } else {
-        limit_lock_wait(transaction, max_pause)?;
+    match job.explicit_lock {
+        Some(mode) => take_explicit_lock(transaction, job.tables, mode, max_pause)?,
+        None => limit_lock_wait(transaction, max_pause)?,
     }
     if let Some(sql) = job.sql {
         transaction.batch_execute(sql)?;
@@ -134,11 +133,16 @@ pub fn lock_and_run(transaction: &mut Transaction, job: &Job, max_pause: Duratio
 
 /// Locks the tables in the order given. The waits share one pause, so each
 /// table gets only the time the tables before it left.
-fn take_access_exclusive(transaction: &mut Transaction, tables: &[String], max_pause: Duration) -> Result<(), postgres::Error> {
+fn take_explicit_lock(
+    transaction: &mut Transaction,
+    tables: &[String],
+    mode: &str,
+    max_pause: Duration,
+) -> Result<(), postgres::Error> {
     let pause_ends_at = Instant::now() + max_pause;
     for table in tables {
         limit_lock_wait(transaction, pause_ends_at.saturating_duration_since(Instant::now()))?;
-        transaction.batch_execute(&format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))?;
+        transaction.batch_execute(&format!("LOCK TABLE {table} IN {mode} MODE"))?;
     }
     Ok(())
 }

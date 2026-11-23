@@ -330,13 +330,14 @@ fn waits_for_a_long_transaction_on_any_of_the_tables() {
     assert_eq!(events[2]["cause"], "long_blockers");
 }
 
-fn access_exclusive_locks(client: &mut Client) -> Vec<(String, bool)> {
+/// Each table with a lock in the given mode, and whether the lock was granted.
+fn locks_in_mode(client: &mut Client, mode: &str) -> Vec<(String, bool)> {
     client
         .query(
             "SELECT relation::regclass::text, granted FROM pg_locks
-              WHERE mode = 'AccessExclusiveLock' AND relation IS NOT NULL
+              WHERE mode = $1 AND relation IS NOT NULL
               ORDER BY relation::regclass::text",
-            &[],
+            &[&mode],
         )
         .unwrap()
         .iter()
@@ -344,26 +345,75 @@ fn access_exclusive_locks(client: &mut Client) -> Vec<(String, bool)> {
         .collect()
 }
 
-#[test]
-fn access_exclusive_is_taken_in_the_order_given() {
+/// Starts the tool on owners and accounts with the flag, while a transaction
+/// holds a row of accounts, and returns the locks it took in the given mode.
+fn locks_taken_with(flag: &str, mode: &str) -> Vec<(String, bool)> {
     create_accounts_with_owners();
     let mut client = connect();
     let (release, blocker) = open_transaction_on_accounts();
 
     let mut lockwise = lockwise_command("tests/window-long-pause.toml", &["owners", "accounts"], "SELECT 1")
-        .arg("--access-exclusive")
+        .arg(flag)
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
-    while access_exclusive_locks(&mut client).len() < 2 {
+    while locks_in_mode(&mut client, mode).len() < 2 {
         thread::sleep(Duration::from_millis(20));
     }
+    let locks = locks_in_mode(&mut client, mode);
 
-    assert_eq!(
-        access_exclusive_locks(&mut client),
-        [("accounts".to_string(), false), ("owners".to_string(), true)]
-    );
     release.send(()).unwrap();
     blocker.join().unwrap();
     assert!(lockwise.wait().unwrap().success());
+    locks
+}
+
+#[test]
+fn access_exclusive_is_taken_in_the_order_given() {
+    let locks = locks_taken_with("--access-exclusive", "AccessExclusiveLock");
+
+    assert_eq!(locks, [("accounts".to_string(), false), ("owners".to_string(), true)]);
+}
+
+#[test]
+fn share_row_exclusive_is_taken_in_the_order_given() {
+    let locks = locks_taken_with("--share-row-exclusive", "ShareRowExclusiveLock");
+
+    assert_eq!(locks, [("accounts".to_string(), false), ("owners".to_string(), true)]);
+}
+
+#[test]
+fn refuses_both_explicit_locks_at_once() {
+    let output = lockwise_command("tests/window.toml", &["accounts"], "SELECT 1")
+        .args(["--access-exclusive", "--share-row-exclusive"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not both"));
+}
+
+const FAIL_UNLESS_STATEMENT_TIMEOUT_IS_700MS: &str = "DO $$ BEGIN
+  IF current_setting('statement_timeout') <> '700ms' THEN
+    RAISE EXCEPTION 'statement_timeout is %', current_setting('statement_timeout');
+  END IF;
+END $$";
+
+#[test]
+fn waits_without_the_statement_timeout_and_gives_it_back_to_the_sql() {
+    create_accounts_table();
+    let (release, holder) = open_transaction("LOCK TABLE accounts IN SHARE UPDATE EXCLUSIVE MODE");
+    let releaser = release_after(release, Duration::from_millis(1500));
+    let connection = format!("{} options='-c statement_timeout=700ms'", connection_string());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lockwise"))
+        .args(["run", "--conn", &connection, "--preset", "tests/window.toml", "--table", "accounts"])
+        .args(["--sql", FAIL_UNLESS_STATEMENT_TIMEOUT_IS_700MS])
+        .output()
+        .unwrap();
+    releaser.join().unwrap();
+    holder.join().unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(names(&events(&output)), ["queued", "prelocked", "acquired", "result"]);
 }
