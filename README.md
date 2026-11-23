@@ -88,11 +88,11 @@ cargo build --release
 target/release/lockwise run \
   --conn "host=localhost user=migrator dbname=app" \
   --preset presets/c1-window-3000ms.toml \
-  --lock accounts:ael \
+  --table accounts \
   --sql "ALTER TABLE accounts ADD COLUMN note text"
 ```
 
-`--lock` takes the table and the mode. The modes are `ael` for `ACCESS EXCLUSIVE` and `sre` for `SHARE ROW EXCLUSIVE`.
+`--table` names the table the SQL changes. The SQL asks for the lock it needs. Add `--access-exclusive` to take `ACCESS EXCLUSIVE` on the table before the SQL runs.
 
 The database user needs the `pg_monitor` role. Use a direct connection to Postgres.
 

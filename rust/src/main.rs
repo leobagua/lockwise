@@ -2,16 +2,17 @@ mod engine;
 mod preset;
 mod window;
 
-use engine::{Job, LockRequest};
+use engine::Job;
 use preset::Preset;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: lockwise run --conn <connection string> --preset <file.toml> --lock <table:ael|sre|sue> [--lock ...] [--sql <ddl>]";
+const USAGE: &str = "usage: lockwise run --conn <connection string> --preset <file.toml> --table <name> [--table ...] [--access-exclusive] [--sql <ddl>]";
 
 struct Arguments {
     connection: String,
     preset: String,
-    locks: Vec<LockRequest>,
+    tables: Vec<String>,
+    access_exclusive: bool,
     sql: Option<String>,
 }
 
@@ -20,24 +21,29 @@ fn parse_arguments() -> Result<Arguments, String> {
     if words.next().as_deref() != Some("run") {
         return Err(USAGE.to_string());
     }
-    let (mut connection, mut preset, mut locks, mut sql) = (None, None, Vec::new(), None);
+    let (mut connection, mut preset, mut tables, mut access_exclusive, mut sql) = (None, None, Vec::new(), false, None);
     while let Some(flag) = words.next() {
+        if flag == "--access-exclusive" {
+            access_exclusive = true;
+            continue;
+        }
         let value = words.next().ok_or(format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--conn" => connection = Some(value),
             "--preset" => preset = Some(value),
-            "--lock" => locks.push(LockRequest::parse(&value)?),
+            "--table" => tables.push(value),
             "--sql" => sql = Some(value),
             other => return Err(format!("unknown flag {other}\n{USAGE}")),
         }
     }
-    if locks.is_empty() {
+    if tables.is_empty() {
         return Err(USAGE.to_string());
     }
     Ok(Arguments {
         connection: connection.ok_or(USAGE)?,
         preset: preset.ok_or(USAGE)?,
-        locks,
+        tables,
+        access_exclusive,
         sql,
     })
 }
@@ -48,7 +54,8 @@ fn main() -> ExitCode {
         let job = Job {
             connection: &arguments.connection,
             preset: &preset,
-            locks: &arguments.locks,
+            tables: &arguments.tables,
+            access_exclusive: arguments.access_exclusive,
             sql: arguments.sql.as_deref(),
         };
         match &preset.window {

@@ -27,17 +27,23 @@ fn create_accounts_table() -> Client {
 
 /// Holds a row lock on accounts until the returned sender is used or dropped.
 fn open_transaction_on_accounts() -> (Sender<()>, JoinHandle<()>) {
+    open_transaction("UPDATE accounts SET id = id WHERE id = 1")
+}
+
+/// Runs the statement in a transaction that stays open until the returned
+/// sender is used or dropped.
+fn open_transaction(statement: &'static str) -> (Sender<()>, JoinHandle<()>) {
     let (release, released) = channel();
-    let (locked, lock_taken) = channel();
+    let (started, has_started) = channel();
     let handle = thread::spawn(move || {
         let mut client = connect();
         let mut transaction = client.transaction().unwrap();
-        transaction.execute("UPDATE accounts SET id = id WHERE id = 1", &[]).unwrap();
-        locked.send(()).unwrap();
+        transaction.batch_execute(statement).unwrap();
+        started.send(()).unwrap();
         let _ = released.recv();
         transaction.commit().unwrap();
     });
-    lock_taken.recv().unwrap();
+    has_started.recv().unwrap();
     (release, handle)
 }
 
@@ -52,7 +58,7 @@ fn lockwise_command(preset: &str, table: &str, sql: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lockwise"));
     command
         .args(["run", "--conn", &connection_string(), "--preset", preset])
-        .args(["--lock", &format!("{table}:ael"), "--sql", sql]);
+        .args(["--table", table, "--sql", sql]);
     command
 }
 
@@ -251,4 +257,51 @@ fn the_weak_lock_moves_a_running_autovacuum_out_of_the_way() {
     assert_eq!(names(&events(&output)), ["queued", "prelocked", "acquired", "result"]);
     assert_eq!(autovacuum_cancellations(), cancellations_before + 1);
     assert!(column_exists(&mut client, "ledger", "note"));
+}
+
+const ADD_FOREIGN_KEY: &str = "ALTER TABLE accounts ADD FOREIGN KEY (owner_id) REFERENCES owners (id) NOT VALID";
+
+fn create_accounts_with_owners() {
+    create_accounts_table()
+        .batch_execute(
+            "DROP TABLE IF EXISTS owners;
+             CREATE TABLE owners (id int PRIMARY KEY);
+             ALTER TABLE accounts ADD COLUMN owner_id int",
+        )
+        .unwrap();
+}
+
+#[test]
+fn the_sql_asks_for_its_own_lock_so_a_foreign_key_does_not_wait_for_a_reader() {
+    create_accounts_with_owners();
+    let (release, reader) = open_transaction("SELECT * FROM accounts");
+
+    let output = lockwise_command("tests/window.toml", "accounts", ADD_FOREIGN_KEY).output().unwrap();
+    release.send(()).unwrap();
+    reader.join().unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(names(&events(&output)), ["queued", "prelocked", "acquired", "result"]);
+}
+
+#[test]
+fn access_exclusive_is_taken_first_when_asked_for_so_the_foreign_key_waits_for_the_reader() {
+    create_accounts_with_owners();
+    let (release, reader) = open_transaction("SELECT * FROM accounts");
+    let releaser = release_after(release, Duration::from_millis(1500));
+
+    let output = lockwise_command("tests/window.toml", "accounts", ADD_FOREIGN_KEY)
+        .arg("--access-exclusive")
+        .output()
+        .unwrap();
+    releaser.join().unwrap();
+    reader.join().unwrap();
+
+    let events = events(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        names(&events),
+        ["queued", "prelocked", "waiting", "prelocked", "waiting", "acquired", "result"]
+    );
+    assert_eq!(events[2]["cause"], "attempt_failed");
 }

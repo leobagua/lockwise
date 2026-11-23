@@ -1,34 +1,19 @@
 use crate::preset::{Kill, Preset, Random, Watcher};
 use postgres::error::SqlState;
-use postgres::{Client, NoTls};
+use postgres::{Client, NoTls, Transaction};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub struct LockRequest {
-    pub table: String,
-    pub mode: &'static str,
-}
-
-impl LockRequest {
-    pub fn parse(spec: &str) -> Result<LockRequest, String> {
-        let (table, mode) = spec.split_once(':').ok_or(format!("--lock expects table:mode, got {spec}"))?;
-        let mode = match mode {
-            "ael" => "ACCESS EXCLUSIVE",
-            "sre" => "SHARE ROW EXCLUSIVE",
-            "sue" => "SHARE UPDATE EXCLUSIVE",
-            other => return Err(format!("unknown lock mode {other}, use ael, sre or sue")),
-        };
-        Ok(LockRequest { table: table.to_string(), mode })
-    }
-}
-
 pub struct Job<'a> {
     pub connection: &'a str,
     pub preset: &'a Preset,
-    pub locks: &'a [LockRequest],
+    pub tables: &'a [String],
+    /// Takes ACCESS EXCLUSIVE on the tables before the SQL runs. Without it
+    /// the SQL asks for the lock it needs.
+    pub access_exclusive: bool,
     pub sql: Option<&'a str>,
 }
 
@@ -55,7 +40,7 @@ pub fn run(job: &Job) -> Result<bool, postgres::Error> {
     let deadline = started + Duration::from_secs(job.preset.max_runtime_s);
     let mut client = Client::connect(job.connection, NoTls)?;
     let backend_pid: i32 = client.query_one("SELECT pg_backend_pid()", &[])?.get(0);
-    let table_oids = table_oids(&mut client, job.locks)?;
+    let table_oids = table_oids(&mut client, job.tables)?;
 
     let watcher_state = Arc::new(WatcherState {
         armed: AtomicBool::new(false),
@@ -126,26 +111,35 @@ pub fn run(job: &Job) -> Result<bool, postgres::Error> {
     Ok(outcome.is_some())
 }
 
-pub fn table_oids(client: &mut Client, locks: &[LockRequest]) -> Result<Vec<u32>, postgres::Error> {
-    locks
+pub fn table_oids(client: &mut Client, tables: &[String]) -> Result<Vec<u32>, postgres::Error> {
+    tables
         .iter()
-        .map(|lock| Ok(client.query_one("SELECT $1::text::regclass::oid", &[&lock.table])?.get(0)))
+        .map(|table| Ok(client.query_one("SELECT $1::text::regclass::oid", &[table])?.get(0)))
         .collect()
+}
+
+/// Runs the SQL with a lock_timeout, after an explicit ACCESS EXCLUSIVE when
+/// the job asks for one.
+pub fn lock_and_run(transaction: &mut Transaction, job: &Job, lock_timeout: Duration) -> Result<(), postgres::Error> {
+    transaction.batch_execute(&format!("SET LOCAL lock_timeout = '{}ms'", lock_timeout.as_millis()))?;
+    if job.access_exclusive {
+        for table in job.tables {
+            transaction.batch_execute(&format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))?;
+        }
+    }
+    if let Some(sql) = job.sql {
+        transaction.batch_execute(sql)?;
+    }
+    Ok(())
 }
 
 fn try_once(client: &mut Client, job: &Job, lock_timeout: Duration) -> Result<AttemptEnd, postgres::Error> {
     let attempt_started = Instant::now();
     let mut transaction = client.transaction()?;
-    let locked = (|| {
-        transaction.batch_execute(&format!("SET LOCAL lock_timeout = '{}ms'", lock_timeout.as_millis()))?;
-        for lock in job.locks {
-            transaction.batch_execute(&format!("LOCK TABLE {} IN {} MODE", lock.table, lock.mode))?;
-        }
-        Ok(())
-    })();
+    let ran = lock_and_run(&mut transaction, job, lock_timeout);
     let waited = attempt_started.elapsed();
 
-    if let Err(error) = locked {
+    if let Err(error) = ran {
         return match retryable_cause(&error) {
             Some(cause) => Ok(AttemptEnd::Retry { waited, cause }),
             None => Err(error),
@@ -154,9 +148,6 @@ fn try_once(client: &mut Client, job: &Job, lock_timeout: Duration) -> Result<At
 
     let acquired_at = Instant::now();
     emit("acquired", json!({ "waited_ms": waited.as_millis() as u64 }));
-    if let Some(sql) = job.sql {
-        transaction.batch_execute(sql)?;
-    }
     transaction.commit()?;
     Ok(AttemptEnd::Done { waited, held: acquired_at.elapsed() })
 }

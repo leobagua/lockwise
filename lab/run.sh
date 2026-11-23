@@ -2,7 +2,7 @@
 # Runs one blocker scenario against one preset and appends a line per repetition
 # to lab/.run/results.tsv.
 # Usage: lab/run.sh <fast|long15x1|long15x3|autovac> <preset name> [repetitions]
-#        VER=17.8 RATE=500 CLIENTS=100 LOCKS="child:ael"
+#        VER=17.8 RATE=500 CLIENTS=100 TABLES="child"
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$HERE")
@@ -12,7 +12,7 @@ REPETITIONS=${3:-5}
 VER=${VER:-17.8}
 RATE=${RATE:-500}
 CLIENTS=${CLIENTS:-100}
-LOCKS=${LOCKS:-child:ael}
+TABLES=${TABLES:-child}
 WARMUP=5
 BIN=${PG_ROOT:-$HOME/.local/share/mise/installs/postgres}/$VER/bin
 RUN=$HERE/.run/$VER
@@ -120,8 +120,11 @@ SQL
   sampler=$!
 
   started=$(now)
+  # The lab measures lock acquisition alone, so every preset but the control
+  # takes ACCESS EXCLUSIVE explicitly and runs no SQL.
   lock_flags=()
-  for lock in $LOCKS; do lock_flags+=(--lock "$lock"); done
+  for table in $TABLES; do lock_flags+=(--table "$table"); done
+  [ "$PRESET" = control ] || lock_flags+=(--access-exclusive)
   "${LOCKWISE:-$ROOT/rust/target/release/lockwise}" run --conn "host=$RUN user=$DDL_USER dbname=lab" \
     --preset "$PRESET_FILE" "${lock_flags[@]}" >"$out/events.jsonl" 2>"$out/lockwise.err"
   finished=$(now)
