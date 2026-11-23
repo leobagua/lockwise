@@ -25,21 +25,24 @@ module Lockwise
                 pg_stat_activity.backend_type, pg_stat_activity.xact_start
     SQL
 
-    def initialize(connection, tables)
+    def initialize(connection, tables, max_pause)
       @connection = connection
       @tables = PG::TextEncoder::Array.new.encode(tables)
+      @max_pause = max_pause
     end
 
-    def of_the_weak_lock
-      find(WEAK_LOCK_CONFLICTS, 0)
+    # Transactions that would keep the tables paused for longer than allowed.
+    def long_transactions
+      find(EVERY_LOCK, @max_pause)
     end
 
-    def of_any_lock
-      find(EVERY_LOCK, 0)
-    end
-
-    def older_than(seconds)
-      find(EVERY_LOCK, seconds)
+    # The sessions to name when the lock gives up for the given reason.
+    def behind(reason)
+      case reason
+      when 'prelock_timeout' then find(WEAK_LOCK_CONFLICTS, 0)
+      when 'long_blockers' then long_transactions
+      else find(EVERY_LOCK, 0)
+      end
     end
 
     private

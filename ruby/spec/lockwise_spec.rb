@@ -136,6 +136,21 @@ RSpec.describe Lockwise do
     end
   end
 
+  it 'releases the weak lock from time to time, so other maintenance gets a turn' do
+    release, blocker = open_transaction
+    sleep 1
+    locker = lock_in_background('accounts', 'ALTER TABLE accounts ADD COLUMN note text',
+                                max_pause: 0.5, poll: 0.05, cooldown: 0.3, weak_lock_hold: 1)
+    sleep 0.05 until weak_lock_held?(connection)
+
+    connection.exec("SET lock_timeout = '3s'")
+    expect { connection.exec("BEGIN; #{Database::WEAK_LOCK}; COMMIT") }.not_to raise_error
+
+    release.push(true)
+    [blocker, locker].each(&:join)
+    expect(column_exists?(connection, 'note')).to be(true)
+  end
+
   it 'gives up after a failed request when there is no time for another one' do
     release, blocker, blocker_pid = open_transaction
 

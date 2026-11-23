@@ -6,18 +6,20 @@ module Lockwise
   # for the lock it needs. The block runs again if that request times out.
   # With access_exclusive: true, ACCESS EXCLUSIVE is taken before the block runs.
   class Lock
-    class AttemptFailed < StandardError; end
-    private_constant :AttemptFailed
+    # Ends the transaction and starts again from the weak lock. The message is the reason.
+    class StartOver < StandardError; end
+    private_constant :StartOver
 
-    def initialize(connection, tables, access_exclusive: false,
-                   max_pause: 3.0, poll: 0.2, cooldown: 10.0, max_runtime: 120.0)
+    def initialize(connection, tables, access_exclusive: false, max_pause: 3.0, poll: 0.2,
+                   cooldown: 10.0, weak_lock_hold: 60.0, max_runtime: 120.0)
       @connection = connection
       @tables = Array(tables)
-      @blockers = Blockers.new(connection, @tables)
+      @blockers = Blockers.new(connection, @tables, max_pause)
       @access_exclusive = access_exclusive
       @max_pause = max_pause
       @poll = poll
       @cooldown = cooldown
+      @weak_lock_hold = weak_lock_hold
       @max_runtime = max_runtime
     end
 
@@ -26,8 +28,8 @@ module Lockwise
       @deadline = monotonic_now + @max_runtime
       begin
         in_transaction(&)
-      rescue AttemptFailed
-        give_up('attempt_failed') { @blockers.of_any_lock } if monotonic_now + @cooldown >= @deadline
+      rescue StartOver => e
+        give_up(e.message) if monotonic_now + @cooldown >= @deadline
         sleep(@cooldown)
         retry
       end
@@ -44,8 +46,8 @@ module Lockwise
 
     def in_transaction(&)
       @connection.exec('BEGIN')
-      give_up('prelock_timeout') { @blockers.of_the_weak_lock } unless take_weak_lock
-      give_up('long_blockers') { @blockers.older_than(@max_pause) } unless wait_for_long_transactions
+      give_up('prelock_timeout') unless take_weak_lock
+      wait_for_long_transactions
       result = with_lock_timeout(&)
       @connection.exec('COMMIT')
       result
@@ -63,10 +65,13 @@ module Lockwise
       false
     end
 
+    # The weak lock keeps VACUUM, ANALYZE and concurrent index builds out, so
+    # it is released after weak_lock_hold to give them a turn.
     def wait_for_long_transactions
-      loop do
-        return true if @blockers.older_than(@max_pause).empty?
-        return false if monotonic_now >= @deadline
+      release_weak_lock_at = monotonic_now + @weak_lock_hold
+      until @blockers.long_transactions.empty?
+        give_up('long_blockers') if monotonic_now >= @deadline
+        raise StartOver, 'long_blockers' if monotonic_now >= release_weak_lock_at
 
         sleep(@poll)
       end
@@ -82,7 +87,7 @@ module Lockwise
     rescue PG::LockNotAvailable
       # A failed request for ACCESS EXCLUSIVE leaves an xid on the transaction,
       # so the whole transaction ends before the next attempt.
-      raise AttemptFailed
+      raise StartOver, 'attempt_failed'
     end
 
     # Locks the tables in the order given. The waits share one pause, so each
@@ -102,10 +107,10 @@ module Lockwise
       @connection.exec_params(sql, [PG::TextEncoder::Array.new.encode(@tables)]).column_values(0)
     end
 
-    # The block finds the blockers, and it runs after the transaction has ended.
+    # Looks for the blockers after the transaction has ended.
     def give_up(reason)
       @connection.exec('ROLLBACK') unless idle?
-      raise GaveUpError.new(reason, yield)
+      raise GaveUpError.new(reason, @blockers.behind(reason))
     end
 
     def idle?
