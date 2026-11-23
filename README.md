@@ -1,8 +1,8 @@
 # lockwise
 
-Runs a DDL on a hot Postgres table and pauses the table only once, for a time you choose.
+Runs a DDL on a hot Postgres table and limits how long the table can be paused.
 
-It is a single binary that talks plain SQL to the server.
+It comes as a Ruby gem and as a single binary. Both follow the same steps and talk plain SQL to the server.
 
 > Current state: prototype.
 
@@ -44,20 +44,19 @@ It does three things, in this order.
 
 1. **Waits without getting in the way.** It first takes a weak lock, `SHARE UPDATE EXCLUSIVE`. This lock does not block reads or writes. It moves autovacuum out of the way and puts DDLs in a queue.
 2. **Looks before it asks.** It checks who is using the table and for how long. If there is a long transaction, it waits for it to end. The table keeps working.
-3. **Asks for the strong lock once, with a deadline.** If it gets the lock, it runs the DDL and releases. If a gap never shows up, it does not ask, and it tells you who is blocking.
+3. **Runs the DDL with a deadline.** The DDL asks for its own operational lock. If the lock comes in time, the DDL runs and everything is released. If it does not, lockwise releases everything, waits a moment and starts again. If a gap never shows up, it gives up and tells you who is blocking.
 
 ```mermaid
 flowchart TD
-    start([lockwise run]) --> weak[Take the weak lock]
+    start([Start]) --> weak[Take the weak lock, SHARE UPDATE EXCLUSIVE]
     weak --> look[Look at who is using the table]
     look --> long{Long transaction in the way?}
     long -- yes --> wait[Wait for it to end. Traffic keeps running]
     wait --> look
-    wait -. time is up .-> gaveup([Give up and list the blockers])
-    long -- no --> strong[Ask for the strong lock once, with a deadline]
-    strong --> got{Got the lock?}
-    got -- yes --> ddl[Run the DDL and commit]
-    ddl --> done([Success])
+    wait -. time is up .-> gaveup([Give up and name the blockers])
+    long -- no --> ddl[Run the DDL with a deadline. The DDL asks for its own operational lock]
+    ddl --> got{Lock in time?}
+    got -- yes --> done([Commit. Success])
     got -- no --> release[Release everything and wait a moment]
     release --> weak
 ```
@@ -69,17 +68,105 @@ flowchart TD
 - **The wait does not block traffic.** Reads and writes keep running, and their locks stay on the fast path.
 - **Autovacuum yields by itself.** A regular autovacuum on the table is cancelled after `deadlock_timeout`. No extra privilege is needed.
 - **DDLs run in order.** Two migrations on the same table queue on the weak lock, in order of arrival.
-- **One pause, with a known size.** The table is paused once, for at most `max_pause_ms`.
-- **Blockers are named.** The `waiting` event lists the sessions in the way.
+- **The DDL takes only the lock it needs.** A foreign key stops writes for a moment and lets reads run.
+- **The pause has a limit.** A lock request waits for at most `max_pause`.
+- **Blockers are named.** When it gives up, lockwise lists the sessions in the way.
 
 ## Disadvantages
 
 - **The strong lock request takes an XID.** A request for `ACCESS EXCLUSIVE` gets a transaction ID before it waits. While it waits, that XID grows the snapshots of other sessions and holds back the vacuum horizon. This also applies to a strong lock request from another session that waits behind the weak lock.
 - **A strong lock request behind the weak lock queues traffic.** If another session asks for a strong lock while lockwise holds the weak lock, new queries queue behind that request until it times out.
-- **Maintenance on the table waits.** While the weak lock is held, `VACUUM`, `ANALYZE` and `CREATE INDEX CONCURRENTLY` on that table wait.
-- **The table is still paused once.** The pause lasts until the transactions in flight end, up to `max_pause_ms`.
+- **Maintenance on the table waits.** While the weak lock is held, `VACUUM`, `ANALYZE` and `CREATE INDEX CONCURRENTLY` on that table wait. lockwise releases the weak lock from time to time to give them a turn.
+- **The table is still paused.** The pause lasts until the transactions in flight end, up to `max_pause`. A request that times out pauses the table too.
 
 ## Usage
+
+### Ruby gem
+
+```ruby
+gem 'lockwise', git: 'https://gitlab.com/l.rosa/lockwise', glob: 'ruby/*.gemspec'
+```
+
+Pass the connection and the table, and run the DDL in the block. In a Rails migration the transaction belongs to lockwise, so the migration turns its own off.
+
+```ruby
+class AddNoteToAccounts < ActiveRecord::Migration[8.0]
+  disable_ddl_transaction!
+
+  def up
+    Lockwise.with_lock(connection, 'accounts') do
+      add_column :accounts, :note, :text
+    end
+  end
+end
+```
+
+The connection can be an ActiveRecord connection or a `PG::Connection`.
+
+The block can run more than once. When its lock request times out, lockwise rolls the transaction back and calls the block again. Keep only the DDL in it.
+
+#### Several tables
+
+Pass a list. lockwise takes the weak lock on all of them and waits for long transactions on any of them.
+
+To control the order of the strong locks, ask for the lock by name. lockwise then takes it before the block runs, on the tables in the order given. Put the busiest table first.
+
+| Option | Lock taken before the block | Use it for |
+|---|---|---|
+| none | none, the DDL asks for its own | one table, one statement |
+| `share_row_exclusive: true` | `SHARE ROW EXCLUSIVE` | adding a foreign key, creating a trigger |
+| `access_exclusive: true` | `ACCESS EXCLUSIVE` | removing a foreign key, swapping two tables |
+
+Adding a foreign key needs `SHARE ROW EXCLUSIVE` on both tables. Reads keep running.
+
+```ruby
+class AddOwnerForeignKeyToAccounts < ActiveRecord::Migration[8.0]
+  disable_ddl_transaction!
+
+  def up
+    Lockwise.with_lock(connection, %w[owners accounts], share_row_exclusive: true) do
+      add_foreign_key :accounts, :owners, validate: false
+    end
+
+    validate_foreign_key :accounts, :owners
+  end
+end
+```
+
+Removing a foreign key needs `ACCESS EXCLUSIVE` on both tables.
+
+```ruby
+class RemoveOwnerForeignKeyFromAccounts < ActiveRecord::Migration[8.0]
+  disable_ddl_transaction!
+
+  def up
+    Lockwise.with_lock(connection, %w[owners accounts], access_exclusive: true) do
+      remove_foreign_key :accounts, :owners
+    end
+  end
+end
+```
+
+#### Options
+
+| Option | Default | Meaning |
+|---|---|---|
+| `max_pause` | `3.0` | the longest a lock request may wait, in seconds |
+| `max_runtime` | `120.0` | total time before giving up |
+| `cooldown` | `10.0` | time between attempts |
+| `poll` | `0.2` | how often it looks at the blockers |
+| `weak_lock_hold` | `60.0` | how long it keeps the weak lock before releasing it for a moment |
+
+The value that matters most is `max_pause`. A shorter pause does less harm and needs a larger gap in traffic.
+
+#### Errors
+
+| Error | When |
+|---|---|
+| `Lockwise::GaveUpError` | The time ran out. `reason` says why and `blockers` lists the sessions in the way. |
+| `Lockwise::TransactionOpenError` | The connection was already in a transaction. |
+
+### Binary
 
 ```bash
 cd rust
@@ -92,40 +179,36 @@ target/release/lockwise run \
   --sql "ALTER TABLE accounts ADD COLUMN note text"
 ```
 
-`--table` names the table the SQL changes. The SQL asks for the lock it needs. Add `--access-exclusive` or `--share-row-exclusive` to take that lock before the SQL runs, on the tables in the order given.
+Repeat `--table` for several tables. Add `--share-row-exclusive` or `--access-exclusive` to take that lock before the SQL runs, on the tables in the order given.
 
-The database user needs the `pg_monitor` role. Use a direct connection to Postgres.
-
-## Configuration
-
-The preset is a TOML file.
+The preset is a TOML file with the same settings as the gem.
 
 ```toml
 name = "c1-window-3000ms"
-max_runtime_s = 120      # total time before giving up
+max_runtime_s = 120
 
 [window]
-max_pause_ms = 3000      # the longest the table may be paused
-cooldown_ms = 10000      # time between attempts
-poll_ms = 200            # how often it looks at the blockers
-prelock_hold_s = 60      # how long it keeps the weak lock
+max_pause_ms = 3000
+cooldown_ms = 10000
+poll_ms = 200
+prelock_hold_s = 60
 ```
 
-The value that matters most is `max_pause_ms`. A shorter pause does less harm and needs a larger gap in traffic.
-
-## Output
-
-The tool writes one JSON event per line.
+The binary writes one JSON event per line.
 
 | Event | Meaning |
 |---|---|
 | `queued` | Started. |
 | `prelocked` | Got the weak lock. |
 | `waiting` | Waiting. Lists who is blocking. |
-| `acquired` | Got the strong lock. |
+| `acquired` | The SQL got its lock and ran. |
 | `result` | Finished, with success or gave up. |
 
 The exit code is `0` for success, `2` for gave up and `1` for error.
+
+## Requirements
+
+The database user needs the `pg_monitor` role, to see the transactions of other users. Use a direct connection to Postgres.
 
 ## Tests
 
