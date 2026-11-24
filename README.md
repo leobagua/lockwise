@@ -8,7 +8,7 @@ It comes as a Ruby gem and as a single binary. Both follow the same steps and ta
 
 ## The problem
 
-![Queries queue behind a DDL that waits for its lock](assets/01-the-problem.mp4){width=50%}
+[![Queries queue behind a DDL that waits for its lock](https://img.youtube.com/vi/fSYranZcFwQ/hqdefault.jpg)](https://www.youtube.com/watch?v=fSYranZcFwQ)
 
 DDL locks on busy tables can lead to lock contention.
 
@@ -16,7 +16,7 @@ A DDL such as `ALTER TABLE` needs a strong lock. While it waits for that lock, e
 
 The usual answer is to ask for the lock with a short timeout and retry. Each request still stops the table for a moment. After hundreds of requests the migration gives up without running, and the contention happened anyway.
 
-![A DDL retries with a short lock timeout and fails every time](assets/02-traditional-lock-retries.mp4){width=50%}
+[![A DDL retries with a short lock timeout and fails every time](https://img.youtube.com/vi/9sPJsAHxmTE/hqdefault.jpg)](https://www.youtube.com/watch?v=9sPJsAHxmTE)
 
 ## The idea, with a bridge
 
@@ -38,7 +38,7 @@ The gate still goes down once. It stays down for a short time, because the worke
 
 ## How lockwise solves it
 
-![lockwise waits on a weak lock and pauses the table once](assets/03-lockwise-the-idea.mp4){width=50%}
+[![lockwise waits on a weak lock and pauses the table once](https://img.youtube.com/vi/xVzBXSboraU/hqdefault.jpg)](https://www.youtube.com/watch?v=xVzBXSboraU)
 
 It does three things, in this order.
 
