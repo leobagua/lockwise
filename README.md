@@ -52,7 +52,11 @@ The cancel is Postgres behaviour. lockwise only waits. It sends no signal and ne
 
 ```mermaid
 flowchart TD
-    start([Start]) --> weak[Take the weak lock, SHARE UPDATE EXCLUSIVE]
+    start([Start]) --> ask[Ask for the weak lock, SHARE UPDATE EXCLUSIVE]
+    ask --> vacuum{Autovacuum on the table?}
+    vacuum -- yes --> cancel[Wait for deadlock_timeout. Postgres cancels the autovacuum]
+    cancel --> weak[Weak lock taken]
+    vacuum -- no --> weak
     weak --> look[Look at who is using the table]
     look --> long{Long transaction in the way?}
     long -- yes --> wait[Wait for it to end. Traffic keeps running]
@@ -62,7 +66,7 @@ flowchart TD
     ddl --> got{Lock in time?}
     got -- yes --> done([Commit. Success])
     got -- no --> release[Release everything and wait a moment]
-    release --> weak
+    release --> ask
 ```
 
 ## What the weak lock blocks
