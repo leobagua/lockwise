@@ -46,6 +46,10 @@ It does three things, in this order.
 2. **Looks before it asks.** It checks who is using the table and for how long. If there is a long transaction, it waits for it to end. The table keeps working.
 3. **Runs the DDL with a deadline.** The DDL asks for its own operational lock. If the lock comes in time, the DDL runs and everything is released. If it does not, lockwise releases everything, waits a moment and starts again. If a gap never shows up, it gives up and tells you who is blocking.
 
+**With an autovacuum on the table.** A regular autovacuum holds the same kind of lock, so the weak lock request queues behind it. When `deadlock_timeout` passes, Postgres takes the autovacuum off the table and gives the weak lock to lockwise. Traffic is not paused while this happens.
+
+The cancel is Postgres behaviour. lockwise only waits. It sends no signal and needs no special privilege. From there the flow is the same, and the DDL runs in the transaction that already holds the weak lock.
+
 ```mermaid
 flowchart TD
     start([Start]) --> weak[Take the weak lock, SHARE UPDATE EXCLUSIVE]
@@ -104,6 +108,40 @@ A regular autovacuum does not wait. It skips the table. The DDL that lockwise ru
 - **A strong lock request behind the weak lock queues traffic.** If another session asks for a strong lock while lockwise holds the weak lock, new queries queue behind that request until it times out.
 - **Maintenance on the table waits.** While the weak lock is held, `VACUUM`, `ANALYZE` and `CREATE INDEX CONCURRENTLY` on that table wait. lockwise releases the weak lock from time to time to give them a turn.
 - **The table is still paused.** The pause lasts until the transactions in flight end, up to `max_pause`. A request that times out pauses the table too.
+
+## Questions and answers
+
+**What kind of transaction gets in the way?**
+
+Any transaction that holds a lock on the table and stays open. A long job, an `idle in transaction` session, a long read.
+
+**What happens when an autovacuum is running on the table?**
+
+lockwise asks for `SHARE UPDATE EXCLUSIVE` and waits. After `deadlock_timeout`, Postgres cancels the autovacuum and lockwise gets the lock. Reads and writes keep running during that wait. Then lockwise runs the DDL, which asks for its own lock in the same transaction.
+
+**Does lockwise cancel the autovacuum?**
+
+No. Postgres does. A session that waits for a lock longer than `deadlock_timeout` and finds a regular autovacuum in its way makes Postgres cancel that autovacuum. lockwise sends no cancel command and needs no extra privilege.
+
+**Autovacuum only yields after `deadlock_timeout`. How is this different from a retry with a short `lock_timeout`?**
+
+A retry asks for the strong lock, so it has to give up fast, usually before `deadlock_timeout`, and the autovacuum never yields. lockwise waits on the weak lock, which does not queue traffic, so it can wait longer than `deadlock_timeout`.
+
+**What is `deadlock_timeout`?**
+
+A Postgres setting. It is how long a session waits for a lock before it checks for a deadlock. The default is 1 second.
+
+**What about an anti-wraparound vacuum?**
+
+Postgres never cancels it. lockwise waits behind it, without queueing traffic, and gives up when the time runs out. It names the vacuum as the blocker.
+
+**What does a cancelled autovacuum cost?**
+
+It starts over the next time. On a table where a vacuum takes hours, that is expensive. Lower autovacuum thresholds on the busiest tables make each run shorter, so a cancelled run costs less.
+
+**Does it help when the traffic is only fast queries?**
+
+The strong lock request still waits for the transactions in flight. With only fast queries, that wait is short.
 
 ## Usage
 
