@@ -189,6 +189,25 @@ RSpec.describe Lockwise do
     expect(inside_the_block).to eq('700ms')
   end
 
+  it 'waits for a long transaction that only touched a partition' do
+    create_events_table_with_two_partitions(connection)
+    # A session that has already written to the partition takes no lock on the parent.
+    update = 'UPDATE events_1 SET id = id'
+    release, writer = open_transaction(update, before: update)
+    sleep 1
+    release_after(release, 1)
+
+    block_runs = 0
+    described_class.with_lock(connection, 'events', max_pause: 0.5, poll: 0.05, cooldown: 0.2) do
+      block_runs += 1
+      connection.exec('ALTER TABLE events ADD COLUMN note text')
+    end
+    writer.join
+
+    expect(block_runs).to eq(1)
+    expect(column_exists?(connection, 'note', table: 'events')).to be(true)
+  end
+
   it 'ignores a long transaction on the same table of another database' do
     connection.close # a database can only be copied while nobody is connected to it
     admin = connect(database: 'postgres')

@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 module Lockwise
-  # Finds the sessions that hold locks on the tables.
+  # Finds the sessions that hold locks on the tables, or on their partitions.
   class Blockers
     WEAK_LOCK_CONFLICTS =
       '{ShareUpdateExclusiveLock,ShareLock,ShareRowExclusiveLock,ExclusiveLock,AccessExclusiveLock}'
@@ -17,7 +17,11 @@ module Lockwise
         JOIN pg_stat_activity ON pg_stat_activity.pid = pg_locks.pid
        WHERE pg_locks.locktype = 'relation'
          AND pg_locks.database = (SELECT pg_database.oid FROM pg_database WHERE pg_database.datname = current_database())
-         AND pg_locks.relation = ANY($1::regclass[])
+         AND pg_locks.relation IN (
+               SELECT target FROM unnest($1::regclass[]) AS target
+               UNION
+               SELECT pg_partition_tree.relid FROM unnest($1::regclass[]) AS target, pg_partition_tree(target)
+             )
          AND pg_locks.granted
          AND pg_locks.pid <> pg_backend_pid()
          AND pg_locks.mode = ANY($2::text[])

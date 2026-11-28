@@ -8,22 +8,15 @@ module Database
     PG.connect(settings)
   end
 
-  def create_accounts_table(connection)
-    connection.exec('SET client_min_messages = warning')
-    connection.exec('DROP TABLE IF EXISTS accounts')
-    connection.exec('CREATE TABLE accounts (id int PRIMARY KEY) WITH (autovacuum_enabled = false)')
-    connection.exec('INSERT INTO accounts VALUES (1)')
-  end
-
   ROW_LOCK = 'UPDATE accounts SET id = id WHERE id = 1'
   WEAK_LOCK = 'LOCK TABLE accounts IN SHARE UPDATE EXCLUSIVE MODE'
 
   # Opens a transaction that runs the given statement and stays open until
   # something is pushed to the returned queue. Also returns its backend pid.
-  def open_transaction(statement = ROW_LOCK)
+  def open_transaction(statement = ROW_LOCK, before: nil)
     release = Queue.new
     started = Queue.new
-    thread = Thread.new { hold_transaction(statement, started, release) }
+    thread = Thread.new { hold_transaction(statement, before, started, release) }
     [release, thread, started.pop]
   end
 
@@ -69,21 +62,6 @@ module Database
     connection.exec_params(sql, [table, column]).getvalue(0, 0) == '1'
   end
 
-  # The cost settings make the autovacuum slow enough to still be running
-  # when the lock starts.
-  def create_ledger_table_with_a_slow_autovacuum(connection)
-    connection.exec('SET client_min_messages = warning')
-    connection.exec('DROP TABLE IF EXISTS ledger')
-    connection.exec(<<~SQL)
-      CREATE TABLE ledger (id int, pad text) WITH (
-        autovacuum_vacuum_threshold = 0, autovacuum_vacuum_scale_factor = 0,
-        autovacuum_vacuum_insert_threshold = -1, autovacuum_analyze_threshold = 2000000000,
-        autovacuum_vacuum_cost_delay = 100, autovacuum_vacuum_cost_limit = 1)
-    SQL
-    connection.exec("INSERT INTO ledger SELECT number, repeat('x', 200) FROM generate_series(1, 50000) AS number")
-    connection.exec('DELETE FROM ledger WHERE id % 2 = 0')
-  end
-
   def autovacuum_running_on_ledger?(connection)
     sql = <<~SQL
       SELECT count(*) FROM pg_stat_activity
@@ -111,8 +89,9 @@ module Database
     connection.exec_params(sql, [granted]).getvalue(0, 0).to_i
   end
 
-  def hold_transaction(statement, started, release)
+  def hold_transaction(statement, before, started, release)
     blocker = connect
+    blocker.exec(before) if before
     blocker.exec('BEGIN')
     blocker.exec(statement)
     started.push(blocker.backend_pid)
