@@ -53,10 +53,6 @@ module Database
     weak_locks(connection, granted: true).positive?
   end
 
-  def weak_lock_waiting?(connection)
-    weak_locks(connection, granted: false).positive?
-  end
-
   def column_exists?(connection, column, table: 'accounts')
     sql = 'SELECT count(*) FROM information_schema.columns WHERE table_name = $1 AND column_name = $2'
     connection.exec_params(sql, [table, column]).getvalue(0, 0) == '1'

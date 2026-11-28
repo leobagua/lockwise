@@ -1,20 +1,25 @@
 # frozen_string_literal: true
 
 module Lockwise
-  # Waits on a weak lock until no long transaction uses the tables, then yields
-  # inside the same transaction with a lock_timeout. The DDL in the block asks
-  # for the lock it needs. The block runs again if that request times out.
+  # Waits, holding no lock, until no long transaction uses the tables. Then, in
+  # one short transaction, takes a weak lock and yields with a lock_timeout.
+  # The DDL in the block asks for the lock it needs. When a lock request times
+  # out, the transaction ends and the run starts over from the wait.
   # With access_exclusive_in_order: true or share_row_exclusive_in_order: true, that lock is
-  # taken before the block runs, on the tables in the order given.
+  # taken before the block runs, on the tables in the order of the list.
   class Lock
-    # Ends the transaction and starts again from the weak lock. The message is the reason.
+    # Ends the transaction and starts again from the wait. The message is the reason.
     class StartOver < StandardError; end
-    # Ends the transaction for good. The message is the reason.
+    # Ends the run for good. The message is the reason.
     class GiveUp < StandardError; end
     private_constant :StartOver, :GiveUp
 
+    # Postgres cancels a regular autovacuum when a session has waited for
+    # deadlock_timeout behind it. The weak lock waits a little longer than that.
+    WEAK_LOCK_MARGIN = 0.5
+
     def initialize(connection, tables, access_exclusive_in_order: false, share_row_exclusive_in_order: false,
-                   max_pause: 3.0, poll: 0.2, cooldown: 10.0, weak_lock_hold: 60.0, max_runtime: 120.0)
+                   max_pause: 3.0, poll: 0.2, cooldown: 10.0, max_runtime: 120.0)
       @connection = Adapters.for(connection)
       @tables = Tables.new(@connection, tables)
       @explicit_lock = explicit_lock(access_exclusive_in_order, share_row_exclusive_in_order)
@@ -22,7 +27,6 @@ module Lockwise
       @max_pause = max_pause
       @poll = poll
       @cooldown = cooldown
-      @weak_lock_hold = weak_lock_hold
       @max_runtime = max_runtime
     end
 
@@ -35,6 +39,7 @@ module Lockwise
     private
 
     def attempt(&)
+      wait_until_clear
       @connection.transaction { lock_and_run(&) }
     rescue StartOver => e
       raise gave_up(e.message) if monotonic_now + @cooldown >= @deadline
@@ -52,36 +57,43 @@ module Lockwise
       raise TransactionOpenError, 'the connection is already in a transaction'
     end
 
-    def lock_and_run(&)
-      raise GiveUp, 'prelock_timeout' unless take_weak_lock
+    # Holds no lock and no transaction. pg_locks is read once per round, and
+    # the wait itself only polls pg_stat_activity.
+    def wait_until_clear
+      loop do
+        long_transactions = @blockers.long_transactions
+        return if long_transactions.empty?
 
-      wait_for_long_transactions
+        until @blockers.gone?(long_transactions)
+          raise GiveUp, 'long_blockers' if monotonic_now >= @deadline
+
+          sleep(@poll)
+        end
+      end
+    end
+
+    def lock_and_run(&)
+      raise StartOver, 'prelock_timeout' unless take_weak_lock
+
       @connection.execute("SET LOCAL statement_timeout = '#{@statement_timeout}'")
       with_lock_timeout(&)
     end
 
-    # The wait for the weak lock has no time limit of its own, so the
-    # statement_timeout is off until the block is about to run.
+    # The statement_timeout is off while the weak lock waits, and comes back
+    # before the block runs.
     def take_weak_lock
       @statement_timeout = @connection.select('SHOW statement_timeout', []).first['statement_timeout']
       @connection.execute('SET LOCAL statement_timeout = 0')
-      limit_lock_wait(@deadline - monotonic_now)
+      limit_lock_wait([deadlock_timeout + WEAK_LOCK_MARGIN, @deadline - monotonic_now].min)
       @connection.execute("LOCK TABLE #{@tables.in_a_stable_order.join(', ')} IN SHARE UPDATE EXCLUSIVE MODE")
       true
     rescue *@connection.lock_timeout_errors
       false
     end
 
-    # The weak lock keeps VACUUM, ANALYZE and concurrent index builds out, so
-    # it is released after weak_lock_hold to give them a turn.
-    def wait_for_long_transactions
-      release_weak_lock_at = monotonic_now + @weak_lock_hold
-      until @blockers.long_transactions.empty?
-        raise GiveUp, 'long_blockers' if monotonic_now >= @deadline
-        raise StartOver, 'long_blockers' if monotonic_now >= release_weak_lock_at
-
-        sleep(@poll)
-      end
+    def deadlock_timeout
+      sql = "SELECT pg_settings.setting FROM pg_settings WHERE pg_settings.name = 'deadlock_timeout'"
+      @deadlock_timeout ||= @connection.select(sql, []).first['setting'].to_f / 1000
     end
 
     def with_lock_timeout

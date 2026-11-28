@@ -8,9 +8,10 @@ RSpec.describe Lockwise, 'with an autovacuum on the table' do
 
   it 'moves the autovacuum out of the way with the weak lock' do
     sleep 0.1 until autovacuum_running_on_ledger?(connection)
+    sleep 0.5 # older than max_pause, and still not something to wait for
     cancellations_before = autovacuum_cancellations
 
-    described_class.with_lock(connection, 'ledger') do
+    described_class.with_lock(connection, 'ledger', max_pause: 0.3, max_runtime: 10) do
       connection.exec('ALTER TABLE ledger ADD COLUMN note text')
     end
 

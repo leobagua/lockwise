@@ -4,7 +4,9 @@ module Lockwise
   class Error < StandardError; end
   class TransactionOpenError < Error; end
 
-  Blocker = Struct.new(:pid, :application, :backend_type, :age)
+  # started tells one transaction of a session from the next. A regular
+  # autovacuum yields to the weak lock, so nobody has to wait for it.
+  Blocker = Struct.new(:pid, :application, :backend_type, :age, :started, :yields_to_weak_lock)
 
   # Raised when the time runs out before the strong lock could be asked for.
   class GaveUpError < Error

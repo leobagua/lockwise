@@ -38,33 +38,49 @@ RSpec.describe Lockwise do
     expect(column_exists?(connection, 'note')).to be(true)
   end
 
-  it 'lets reads and writes run while it waits on the weak lock' do
+  it 'holds no lock while it waits, so traffic and maintenance keep running' do
     release, blocker = open_transaction
     sleep 1
     locker = lock_in_background('accounts', 'ALTER TABLE accounts ADD COLUMN note text', max_pause: 0.5, poll: 0.05)
-    sleep 0.05 until weak_lock_held?(connection)
+    sleep 0.5 # the lock is now waiting for the long transaction
 
+    expect(weak_lock_held?(connection)).to be(false)
     connection.exec("SET lock_timeout = '200ms'")
     connection.exec('INSERT INTO accounts VALUES (2)')
     expect(connection.exec('SELECT count(*) FROM accounts').getvalue(0, 0)).to eq('2')
+    expect { connection.exec("BEGIN; #{Database::WEAK_LOCK}; COMMIT") }.not_to raise_error
 
     release.push(true)
     [blocker, locker].each(&:join)
     expect(column_exists?(connection, 'note')).to be(true)
   end
 
-  it 'makes two runs on the same table take turns, in order of arrival' do
+  it 'reads pg_locks once per round while it waits' do
+    reads = 0
+    allow(connection).to receive(:exec_params).and_wrap_original do |original, sql, *rest|
+      reads += 1 if sql.include?('pg_locks')
+      original.call(sql, *rest)
+    end
     release, blocker = open_transaction
     sleep 1
-    first = lock_in_background('accounts', 'ALTER TABLE accounts ADD COLUMN note text', max_pause: 0.5, poll: 0.05)
-    sleep 0.05 until weak_lock_held?(connection)
-    second = lock_in_background('accounts', 'ALTER TABLE accounts ADD COLUMN owner text', max_pause: 0.5, poll: 0.05)
-    sleep 0.05 until weak_lock_waiting?(connection)
+    release_after(release, 1)
 
-    release.push(true)
+    described_class.with_lock(connection, 'accounts', max_pause: 0.5, poll: 0.05) { nil }
     blocker.join
 
-    expect(first.value).to be < second.value
+    expect(reads).to eq(2) # one that finds the long transaction, one after it is gone
+  end
+
+  it 'lets two runs on the same table both finish' do
+    release, blocker = open_transaction
+    sleep 1
+    options = { max_pause: 0.5, poll: 0.05, cooldown: 0.2 }
+    first = lock_in_background('accounts', 'ALTER TABLE accounts ADD COLUMN note text', **options)
+    second = lock_in_background('accounts', 'ALTER TABLE accounts ADD COLUMN owner text', **options)
+
+    release.push(true)
+    [blocker, first, second].each(&:join)
+
     expect(column_exists?(connection, 'note')).to be(true)
     expect(column_exists?(connection, 'owner')).to be(true)
   end
@@ -173,25 +189,10 @@ RSpec.describe Lockwise do
     end
   end
 
-  it 'releases the weak lock from time to time, so other maintenance gets a turn' do
-    release, blocker = open_transaction
-    sleep 1
-    locker = lock_in_background('accounts', 'ALTER TABLE accounts ADD COLUMN note text',
-                                max_pause: 0.5, poll: 0.05, cooldown: 0.3, weak_lock_hold: 1)
-    sleep 0.05 until weak_lock_held?(connection)
-
-    connection.exec("SET lock_timeout = '3s'")
-    expect { connection.exec("BEGIN; #{Database::WEAK_LOCK}; COMMIT") }.not_to raise_error
-
-    release.push(true)
-    [blocker, locker].each(&:join)
-    expect(column_exists?(connection, 'note')).to be(true)
-  end
-
   it 'waits without the statement_timeout and gives it back to the block' do
     connection.exec("SET statement_timeout = '700ms'")
     release, holder = open_transaction(Database::WEAK_LOCK)
-    release_after(release, 1.5)
+    release_after(release, 1) # longer than the statement_timeout, shorter than the weak lock wait
 
     inside_the_block = described_class.with_lock(connection, 'accounts') do
       connection.exec('SHOW statement_timeout').getvalue(0, 0)

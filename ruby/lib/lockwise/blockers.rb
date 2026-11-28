@@ -38,17 +38,22 @@ module Lockwise
       SELECT pg_stat_activity.pid,
              pg_stat_activity.application_name,
              pg_stat_activity.backend_type,
-             extract(epoch FROM clock_timestamp() - pg_stat_activity.xact_start) AS age
+             extract(epoch FROM clock_timestamp() - pg_stat_activity.xact_start) AS age,
+             pg_stat_activity.xact_start::text AS started,
+             pg_stat_activity.backend_type = 'autovacuum worker'
+               AND pg_stat_activity.query NOT LIKE '%(to prevent wraparound)' AS yields_to_weak_lock
         FROM table_locks
         JOIN pg_stat_activity ON pg_stat_activity.pid = table_locks.pid
        WHERE pg_stat_activity.xact_start <= clock_timestamp() - make_interval(secs => $3)
-       GROUP BY pg_stat_activity.pid, pg_stat_activity.application_name,
-                pg_stat_activity.backend_type, pg_stat_activity.xact_start
+       GROUP BY pg_stat_activity.pid, pg_stat_activity.application_name, pg_stat_activity.backend_type,
+                pg_stat_activity.xact_start, pg_stat_activity.query
       UNION ALL
       SELECT NULL::integer,
              pg_prepared_xacts.gid,
              'prepared transaction',
-             extract(epoch FROM clock_timestamp() - pg_prepared_xacts.prepared)
+             extract(epoch FROM clock_timestamp() - pg_prepared_xacts.prepared),
+             NULL::text,
+             false
         FROM table_locks
         JOIN all_locks ON all_locks.virtualtransaction = table_locks.virtualtransaction
                       AND all_locks.locktype = 'transactionid'
@@ -56,6 +61,18 @@ module Lockwise
        WHERE table_locks.pid IS NULL
          AND pg_prepared_xacts.prepared <= clock_timestamp() - make_interval(secs => $3)
        GROUP BY pg_prepared_xacts.gid, pg_prepared_xacts.prepared
+    SQL
+
+    # Counts the transactions of a list that are still open. It reads
+    # pg_stat_activity and pg_prepared_xacts, and stays off the lock manager.
+    STILL_OPEN = <<~SQL
+      SELECT (SELECT count(*)
+                FROM pg_stat_activity
+               WHERE (pg_stat_activity.pid, pg_stat_activity.xact_start) IN (
+                       SELECT waited.pid, waited.started
+                         FROM unnest($1::integer[], $2::timestamptz[]) AS waited(pid, started)
+                     ))
+           + (SELECT count(*) FROM pg_prepared_xacts WHERE pg_prepared_xacts.gid = ANY($3::text[])) AS still_open
     SQL
 
     def initialize(connection, tables, max_pause, explicit_lock)
@@ -67,7 +84,13 @@ module Lockwise
 
     # Transactions that would keep the tables paused for longer than allowed.
     def long_transactions
-      find(@conflicts, @max_pause)
+      find(@conflicts, @max_pause).reject(&:yields_to_weak_lock)
+    end
+
+    def gone?(blockers)
+      sessions, prepared = blockers.partition(&:pid)
+      binds = [sessions.map(&:pid), sessions.map(&:started), prepared.map(&:application)]
+      @connection.select(STILL_OPEN, binds).first['still_open'].to_i.zero?
     end
 
     # The sessions to name when the lock gives up for the given reason.
@@ -82,10 +105,9 @@ module Lockwise
     private
 
     def find(modes, minimum_age)
-      # Inside a transaction, pg_stat_activity is frozen at its first read.
-      @connection.execute('SELECT pg_stat_clear_snapshot()')
       @connection.select(QUERY, [@tables, modes, minimum_age]).map do |row|
-        Blocker.new(row['pid']&.to_i, row['application_name'], row['backend_type'], row['age'].to_f)
+        Blocker.new(row['pid']&.to_i, row['application_name'], row['backend_type'], row['age'].to_f,
+                    row['started'], [true, 't'].include?(row['yields_to_weak_lock']))
       end
     end
   end
