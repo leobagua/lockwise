@@ -7,6 +7,10 @@ module Lockwise
       '{ShareUpdateExclusiveLock,ShareLock,ShareRowExclusiveLock,ExclusiveLock,AccessExclusiveLock}'
     # The lock the DDL will ask for is unknown, so any holder may be in its way.
     EVERY_LOCK = "{AccessShareLock,RowShareLock,RowExclusiveLock,#{WEAK_LOCK_CONFLICTS.delete('{}')}}".freeze
+    # When the caller names the lock, only the modes that conflict with it count.
+    CONFLICTS = {
+      'SHARE ROW EXCLUSIVE' => "{RowExclusiveLock,#{WEAK_LOCK_CONFLICTS.delete('{}')}}"
+    }.freeze
 
     # A prepared transaction keeps its locks without a session, so it is not in
     # pg_stat_activity. Its locks have no pid, and its transactionid lock leads
@@ -54,15 +58,16 @@ module Lockwise
        GROUP BY pg_prepared_xacts.gid, pg_prepared_xacts.prepared
     SQL
 
-    def initialize(connection, tables, max_pause)
+    def initialize(connection, tables, max_pause, explicit_lock)
       @connection = connection
       @tables = PG::TextEncoder::Array.new.encode(tables)
       @max_pause = max_pause
+      @conflicts = CONFLICTS.fetch(explicit_lock, EVERY_LOCK)
     end
 
     # Transactions that would keep the tables paused for longer than allowed.
     def long_transactions
-      find(EVERY_LOCK, @max_pause)
+      find(@conflicts, @max_pause)
     end
 
     # The sessions to name when the lock gives up for the given reason.
@@ -70,7 +75,7 @@ module Lockwise
       case reason
       when 'prelock_timeout' then find(WEAK_LOCK_CONFLICTS, 0)
       when 'long_blockers' then long_transactions
-      else find(EVERY_LOCK, 0)
+      else find(@conflicts, 0)
       end
     end
 

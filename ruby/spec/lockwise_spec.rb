@@ -103,6 +103,17 @@ RSpec.describe Lockwise do
       expect(applied_at).to be < releaser.value
     end
 
+    it 'does not wait for a long reader either, with SHARE ROW EXCLUSIVE' do
+      release, reader = open_transaction('SELECT * FROM accounts')
+      sleep 1 # older than max_pause, but a reader does not conflict with this lock
+      releaser = release_after(release, 1.5)
+
+      applied_at = add_foreign_key_at(share_row_exclusive: true)
+      reader.join
+
+      expect(applied_at).to be < releaser.value
+    end
+
     it 'takes ACCESS EXCLUSIVE first when asked to, so it waits for the reader' do
       release, reader = open_transaction('SELECT * FROM accounts')
       releaser = release_after(release, 1.5)
@@ -156,7 +167,8 @@ RSpec.describe Lockwise do
     end
 
     it 'refuses both explicit locks at once' do
-      expect { described_class.with_lock(connection, 'accounts', access_exclusive: true, share_row_exclusive: true) }
+      both = { access_exclusive: true, share_row_exclusive: true }
+      expect { described_class.with_lock(connection, 'accounts', **both) }
         .to raise_error(ArgumentError)
     end
   end

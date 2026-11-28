@@ -17,8 +17,8 @@ module Lockwise
                    max_pause: 3.0, poll: 0.2, cooldown: 10.0, weak_lock_hold: 60.0, max_runtime: 120.0)
       @connection = Adapters.for(connection)
       @tables = Array(tables)
-      @blockers = Blockers.new(@connection, @tables, max_pause)
       @explicit_lock = explicit_lock(access_exclusive, share_row_exclusive)
+      @blockers = Blockers.new(@connection, @tables, max_pause, @explicit_lock)
       @max_pause = max_pause
       @poll = poll
       @cooldown = cooldown
