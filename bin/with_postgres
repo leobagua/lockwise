@@ -19,6 +19,7 @@ unix_socket_directories = '$RUN'
 fsync = off
 autovacuum_naptime = 1s
 deadlock_timeout = 1s
+max_prepared_transactions = 5
 CONF
 "$BIN/pg_ctl" -D "$RUN/data" -l "$RUN/server.log" -w start >/dev/null
 "$BIN/psql" -X -q -h "$RUN" -U postgres -d postgres -v ON_ERROR_STOP=1 \

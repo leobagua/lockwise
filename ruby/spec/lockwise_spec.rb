@@ -208,6 +208,39 @@ RSpec.describe Lockwise do
     expect(column_exists?(connection, 'note', table: 'events')).to be(true)
   end
 
+  it 'waits for a prepared transaction, which has no session' do
+    preparer = connect
+    preparer.exec("BEGIN; UPDATE accounts SET id = id; PREPARE TRANSACTION 'lockwise_spec'")
+    sleep 1
+    finisher = Thread.new do
+      sleep 1
+      preparer.exec("COMMIT PREPARED 'lockwise_spec'")
+    end
+
+    block_runs = 0
+    described_class.with_lock(connection, 'accounts', max_pause: 0.5, poll: 0.05, cooldown: 0.2) do
+      block_runs += 1
+      connection.exec('ALTER TABLE accounts ADD COLUMN note text')
+    end
+    finisher.join
+
+    expect(block_runs).to eq(1)
+  ensure
+    preparer.close
+  end
+
+  it 'names a prepared transaction when it gives up' do
+    preparer = connect
+    preparer.exec("BEGIN; UPDATE accounts SET id = id; PREPARE TRANSACTION 'lockwise_spec'")
+    sleep 1
+
+    expect { described_class.with_lock(connection, 'accounts', max_pause: 0.5, max_runtime: 1) { nil } }
+      .to raise_error(Lockwise::GaveUpError, /lockwise_spec \(prepared transaction/)
+  ensure
+    preparer.exec("ROLLBACK PREPARED 'lockwise_spec'")
+    preparer.close
+  end
+
   it 'ignores a long transaction on the same table of another database' do
     connection.close # a database can only be copied while nobody is connected to it
     admin = connect(database: 'postgres')

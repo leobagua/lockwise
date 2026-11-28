@@ -21,7 +21,12 @@ module Lockwise
     def describe_blockers
       return 'no session in sight' if blockers.empty?
 
-      blockers.map { |blocker| "pid #{blocker.pid} (#{blocker.backend_type}, #{blocker.age.round(1)}s)" }.join(', ')
+      blockers.map { |blocker| "#{name_of(blocker)} (#{blocker.backend_type}, #{blocker.age.round(1)}s)" }.join(', ')
+    end
+
+    # A prepared transaction has no pid. Its application is its identifier.
+    def name_of(blocker)
+      blocker.pid ? "pid #{blocker.pid}" : blocker.application
     end
   end
 end
