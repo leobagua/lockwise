@@ -201,6 +201,21 @@ RSpec.describe Lockwise do
     expect(inside_the_block).to eq('700ms')
   end
 
+  it 'reads the table name the way SQL does' do
+    connection.exec('DROP TABLE IF EXISTS "Mixed"; CREATE TABLE "Mixed" (id int)')
+    names = ['accounts', 'public.accounts', 'ACCOUNTS', :accounts, '"Mixed"']
+
+    locked = names.map do |name|
+      described_class.with_lock(connection, name, access_exclusive_in_order: true) do
+        locks_in_mode(connection, 'AccessExclusiveLock').keys
+      end
+    end
+
+    expect(locked).to eq([['accounts'], ['accounts'], ['accounts'], ['accounts'], ['"Mixed"']])
+  ensure
+    connection.exec('DROP TABLE IF EXISTS "Mixed"')
+  end
+
   it 'waits for a long transaction that only touched a partition' do
     create_events_table_with_two_partitions(connection)
     # A session that has already written to the partition takes no lock on the parent.

@@ -11,6 +11,11 @@ module Lockwise
       end
     end
 
+    # Postgres takes a list as one parameter, written as an array literal.
+    def self.encode(binds)
+      binds.map { |bind| bind.is_a?(Array) ? PG::TextEncoder::Array.new.encode(bind) : bind }
+    end
+
     # A connection from the pg gem.
     class Pg
       def initialize(connection)
@@ -18,8 +23,7 @@ module Lockwise
       end
 
       def execute(sql) = @connection.exec(sql)
-      def select(sql, binds) = @connection.exec_params(sql, binds).to_a
-      def quote(table) = @connection.quote_ident(table)
+      def select(sql, binds) = @connection.exec_params(sql, Adapters.encode(binds)).to_a
       def idle? = @connection.transaction_status == PG::PQTRANS_IDLE
       def lock_timeout_errors = [PG::LockNotAvailable]
 
@@ -42,8 +46,7 @@ module Lockwise
       end
 
       def execute(sql) = @connection.execute(sql)
-      def select(sql, binds) = @connection.exec_query(sql, 'Lockwise', binds).to_a
-      def quote(table) = @connection.quote_table_name(table)
+      def select(sql, binds) = @connection.exec_query(sql, 'Lockwise', Adapters.encode(binds)).to_a
       def idle? = !@connection.transaction_open?
       def lock_timeout_errors = [::ActiveRecord::LockWaitTimeout]
       def transaction(&) = @connection.transaction(&)

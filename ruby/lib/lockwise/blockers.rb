@@ -60,7 +60,7 @@ module Lockwise
 
     def initialize(connection, tables, max_pause, explicit_lock)
       @connection = connection
-      @tables = PG::TextEncoder::Array.new.encode(tables)
+      @tables = tables
       @max_pause = max_pause
       @conflicts = CONFLICTS.fetch(explicit_lock, EVERY_LOCK)
     end

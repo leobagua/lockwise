@@ -16,9 +16,9 @@ module Lockwise
     def initialize(connection, tables, access_exclusive_in_order: false, share_row_exclusive_in_order: false,
                    max_pause: 3.0, poll: 0.2, cooldown: 10.0, weak_lock_hold: 60.0, max_runtime: 120.0)
       @connection = Adapters.for(connection)
-      @tables = Array(tables)
+      @tables = Tables.new(@connection, tables)
       @explicit_lock = explicit_lock(access_exclusive_in_order, share_row_exclusive_in_order)
-      @blockers = Blockers.new(@connection, @tables, max_pause, @explicit_lock)
+      @blockers = Blockers.new(@connection, @tables.names, max_pause, @explicit_lock)
       @max_pause = max_pause
       @poll = poll
       @cooldown = cooldown
@@ -66,7 +66,7 @@ module Lockwise
       @statement_timeout = @connection.select('SHOW statement_timeout', []).first['statement_timeout']
       @connection.execute('SET LOCAL statement_timeout = 0')
       limit_lock_wait(@deadline - monotonic_now)
-      @connection.execute("LOCK TABLE #{quoted(tables_in_a_stable_order).join(', ')} IN SHARE UPDATE EXCLUSIVE MODE")
+      @connection.execute("LOCK TABLE #{@tables.in_a_stable_order.join(', ')} IN SHARE UPDATE EXCLUSIVE MODE")
       true
     rescue *@connection.lock_timeout_errors
       false
@@ -101,7 +101,7 @@ module Lockwise
     # table gets only the time the tables before it left.
     def take_explicit_lock
       pause_ends_at = monotonic_now + @max_pause
-      quoted(@tables).each do |table|
+      @tables.in_list_order.each do |table|
         limit_lock_wait(pause_ends_at - monotonic_now)
         @connection.execute("LOCK TABLE #{table} IN #{@explicit_lock} MODE")
       end
@@ -117,13 +117,6 @@ module Lockwise
       'SHARE ROW EXCLUSIVE' if share_row_exclusive_in_order
     end
 
-    # Two runs that share tables take the weak locks in the same order, so
-    # that they queue instead of deadlocking.
-    def tables_in_a_stable_order
-      sql = 'SELECT name FROM unnest($1::text[]) AS name ORDER BY name::regclass::oid'
-      @connection.select(sql, [PG::TextEncoder::Array.new.encode(@tables)]).map { |row| row['name'] }
-    end
-
     # Called after the transaction has ended, so the blockers are looked up outside it.
     def gave_up(reason)
       GaveUpError.new(reason, @blockers.behind(reason))
@@ -136,10 +129,6 @@ module Lockwise
 
     def monotonic_now
       Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    end
-
-    def quoted(tables)
-      tables.map { |table| @connection.quote(table) }
     end
   end
 end
