@@ -177,13 +177,22 @@ The block can run more than once. When its lock request times out, lockwise roll
 
 Pass a list. lockwise takes the weak lock on all of them and waits for long transactions on any of them.
 
-To control the order of the strong locks, ask for the lock by name. lockwise then takes it before the block runs, on the tables in the order given. Put the busiest table first.
+Without an option, the DDL asks for its own strong lock, and Postgres chooses the order of the tables.
 
-| Option | Lock taken before the block | Use it for |
-|---|---|---|
-| none | none, the DDL asks for its own | one table, one statement |
-| `share_row_exclusive: true` | `SHARE ROW EXCLUSIVE` | adding a foreign key, creating a trigger |
-| `access_exclusive: true` | `ACCESS EXCLUSIVE` | removing a foreign key, swapping two tables |
+To choose the order yourself, use one of the `_in_order` options. lockwise then takes that lock before the block runs, **on the tables in the order of the list**. Put the busiest table first.
+
+```ruby
+Lockwise.with_lock(connection, %w[owners accounts], share_row_exclusive_in_order: true) { ... }
+# locks owners first, then accounts
+```
+
+| Option | Who takes the strong lock | Lock | Order of the tables |
+|---|---|---|---|
+| none | the DDL | the one it needs | chosen by Postgres |
+| `share_row_exclusive_in_order: true` | lockwise, before the block | `SHARE ROW EXCLUSIVE` | the order of the list |
+| `access_exclusive_in_order: true` | lockwise, before the block | `ACCESS EXCLUSIVE` | the order of the list |
+
+Use `share_row_exclusive_in_order` to add a foreign key or create a trigger. Use `access_exclusive_in_order` to remove a foreign key or swap two tables.
 
 Adding a foreign key needs `SHARE ROW EXCLUSIVE` on both tables. Reads keep running.
 
@@ -192,7 +201,7 @@ class AddOwnerForeignKeyToAccounts < ActiveRecord::Migration[8.0]
   disable_ddl_transaction!
 
   def up
-    Lockwise.with_lock(connection, %w[owners accounts], share_row_exclusive: true) do
+    Lockwise.with_lock(connection, %w[owners accounts], share_row_exclusive_in_order: true) do
       add_foreign_key :accounts, :owners, validate: false
     end
 
@@ -208,7 +217,7 @@ class RemoveOwnerForeignKeyFromAccounts < ActiveRecord::Migration[8.0]
   disable_ddl_transaction!
 
   def up
-    Lockwise.with_lock(connection, %w[owners accounts], access_exclusive: true) do
+    Lockwise.with_lock(connection, %w[owners accounts], access_exclusive_in_order: true) do
       remove_foreign_key :accounts, :owners
     end
   end

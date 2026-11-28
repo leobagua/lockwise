@@ -97,7 +97,7 @@ RSpec.describe Lockwise do
       release, reader = open_transaction('SELECT * FROM accounts')
       releaser = release_after(release, 1.5)
 
-      applied_at = add_foreign_key_at(share_row_exclusive: true)
+      applied_at = add_foreign_key_at(share_row_exclusive_in_order: true)
       reader.join
 
       expect(applied_at).to be < releaser.value
@@ -108,7 +108,7 @@ RSpec.describe Lockwise do
       sleep 1 # older than max_pause, but a reader does not conflict with this lock
       releaser = release_after(release, 1.5)
 
-      applied_at = add_foreign_key_at(share_row_exclusive: true)
+      applied_at = add_foreign_key_at(share_row_exclusive_in_order: true)
       reader.join
 
       expect(applied_at).to be < releaser.value
@@ -118,7 +118,7 @@ RSpec.describe Lockwise do
       release, reader = open_transaction('SELECT * FROM accounts')
       releaser = release_after(release, 1.5)
 
-      applied_at = add_foreign_key_at(access_exclusive: true)
+      applied_at = add_foreign_key_at(access_exclusive_in_order: true)
       reader.join
 
       expect(applied_at).to be > releaser.value
@@ -148,7 +148,7 @@ RSpec.describe Lockwise do
 
     it 'takes ACCESS EXCLUSIVE in the order given' do
       release, blocker = open_transaction
-      locker = lock_in_background(%w[owners accounts], 'SELECT 1', access_exclusive: true, max_pause: 5)
+      locker = lock_in_background(%w[owners accounts], 'SELECT 1', access_exclusive_in_order: true, max_pause: 5)
       sleep 0.05 until locks_in_mode(connection, 'AccessExclusiveLock').size == 2
 
       expect(locks_in_mode(connection, 'AccessExclusiveLock')).to eq('owners' => true, 'accounts' => false)
@@ -158,7 +158,7 @@ RSpec.describe Lockwise do
 
     it 'takes SHARE ROW EXCLUSIVE in the order given' do
       release, blocker = open_transaction
-      locker = lock_in_background(%w[owners accounts], 'SELECT 1', share_row_exclusive: true, max_pause: 5)
+      locker = lock_in_background(%w[owners accounts], 'SELECT 1', share_row_exclusive_in_order: true, max_pause: 5)
       sleep 0.05 until locks_in_mode(connection, 'ShareRowExclusiveLock').size == 2
 
       expect(locks_in_mode(connection, 'ShareRowExclusiveLock')).to eq('owners' => true, 'accounts' => false)
@@ -167,7 +167,7 @@ RSpec.describe Lockwise do
     end
 
     it 'refuses both explicit locks at once' do
-      both = { access_exclusive: true, share_row_exclusive: true }
+      both = { access_exclusive_in_order: true, share_row_exclusive_in_order: true }
       expect { described_class.with_lock(connection, 'accounts', **both) }
         .to raise_error(ArgumentError)
     end

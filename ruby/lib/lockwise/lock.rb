@@ -4,7 +4,7 @@ module Lockwise
   # Waits on a weak lock until no long transaction uses the tables, then yields
   # inside the same transaction with a lock_timeout. The DDL in the block asks
   # for the lock it needs. The block runs again if that request times out.
-  # With access_exclusive: true or share_row_exclusive: true, that lock is
+  # With access_exclusive_in_order: true or share_row_exclusive_in_order: true, that lock is
   # taken before the block runs, on the tables in the order given.
   class Lock
     # Ends the transaction and starts again from the weak lock. The message is the reason.
@@ -13,11 +13,11 @@ module Lockwise
     class GiveUp < StandardError; end
     private_constant :StartOver, :GiveUp
 
-    def initialize(connection, tables, access_exclusive: false, share_row_exclusive: false,
+    def initialize(connection, tables, access_exclusive_in_order: false, share_row_exclusive_in_order: false,
                    max_pause: 3.0, poll: 0.2, cooldown: 10.0, weak_lock_hold: 60.0, max_runtime: 120.0)
       @connection = Adapters.for(connection)
       @tables = Array(tables)
-      @explicit_lock = explicit_lock(access_exclusive, share_row_exclusive)
+      @explicit_lock = explicit_lock(access_exclusive_in_order, share_row_exclusive_in_order)
       @blockers = Blockers.new(@connection, @tables, max_pause, @explicit_lock)
       @max_pause = max_pause
       @poll = poll
@@ -107,14 +107,14 @@ module Lockwise
       end
     end
 
-    def explicit_lock(access_exclusive, share_row_exclusive)
-      if access_exclusive && share_row_exclusive
-        raise ArgumentError, 'choose access_exclusive or share_row_exclusive, not both'
+    def explicit_lock(access_exclusive_in_order, share_row_exclusive_in_order)
+      if access_exclusive_in_order && share_row_exclusive_in_order
+        raise ArgumentError, 'choose access_exclusive_in_order or share_row_exclusive_in_order, not both'
       end
 
-      return 'ACCESS EXCLUSIVE' if access_exclusive
+      return 'ACCESS EXCLUSIVE' if access_exclusive_in_order
 
-      'SHARE ROW EXCLUSIVE' if share_row_exclusive
+      'SHARE ROW EXCLUSIVE' if share_row_exclusive_in_order
     end
 
     # Two runs that share tables take the weak locks in the same order, so
