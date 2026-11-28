@@ -2,8 +2,10 @@
 
 # Helpers that talk to the throwaway Postgres started by bin/test.
 module Database
-  def connect
-    PG.connect(ENV.fetch('LOCKWISE_TEST_CONN') { raise 'run the specs through bin/test' })
+  def connect(database: nil)
+    settings = ENV.fetch('LOCKWISE_TEST_CONN') { raise 'run the specs through bin/test' }
+    settings = settings.sub(/dbname=\S+/, "dbname=#{database}") if database
+    PG.connect(settings)
   end
 
   def create_accounts_table(connection)

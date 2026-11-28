@@ -16,6 +16,7 @@ module Lockwise
         FROM pg_locks
         JOIN pg_stat_activity ON pg_stat_activity.pid = pg_locks.pid
        WHERE pg_locks.locktype = 'relation'
+         AND pg_locks.database = (SELECT pg_database.oid FROM pg_database WHERE pg_database.datname = current_database())
          AND pg_locks.relation = ANY($1::regclass[])
          AND pg_locks.granted
          AND pg_locks.pid <> pg_backend_pid()

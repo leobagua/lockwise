@@ -4,7 +4,7 @@ RSpec.describe Lockwise do
   let(:connection) { connect }
 
   before { create_accounts_table(connection) }
-  after { connection.close }
+  after { connection.close unless connection.finished? }
 
   it 'waits for an open transaction to end, then runs the block' do
     release, blocker = open_transaction
@@ -187,6 +187,27 @@ RSpec.describe Lockwise do
     holder.join
 
     expect(inside_the_block).to eq('700ms')
+  end
+
+  it 'ignores a long transaction on the same table of another database' do
+    connection.close # a database can only be copied while nobody is connected to it
+    admin = connect(database: 'postgres')
+    admin.exec('DROP DATABASE IF EXISTS lab_copy')
+    admin.exec('CREATE DATABASE lab_copy TEMPLATE lab')
+    reader = connect(database: 'lab_copy')
+    reader.exec('BEGIN; SELECT * FROM accounts')
+    sleep 1
+
+    here = connect
+    described_class.with_lock(here, 'accounts', max_pause: 0.5, max_runtime: 2) do
+      here.exec('ALTER TABLE accounts ADD COLUMN note text')
+    end
+
+    expect(column_exists?(here, 'note')).to be(true)
+  ensure
+    [reader, here].each { |session| session&.close }
+    admin&.exec('DROP DATABASE IF EXISTS lab_copy')
+    admin&.close
   end
 
   it 'gives up after a failed request when there is no time for another one' do
